@@ -1,0 +1,133 @@
+# =============================================================================
+# Dockerfile.model — modeling / feature-engineering gRPC code-server image
+# =============================================================================
+# Sibling of `Dockerfile.ingestion` dedicated to machine-learning
+# workloads: BirdWeather feature engineering, BirdNET and Perch v2
+# embedding extraction, and future modeling and evaluation jobs. The
+# Dagster `defs` are exposed as a separate gRPC code-server so the
+# modeling stack can scale and be rebuilt independently of the ingestion
+# worker.
+#
+# The build mirrors Dockerfile.ingestion's two-stage layout. The
+# difference is the additional `embeddings` Poetry group (TensorFlow CPU,
+# kagglehub) which is installed here so the BirdNET / Perch v2 stack is
+# available at runtime.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Stage 1 — builder
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+# Build-time toolchain (psycopg2 build dependencies).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    # Install into the system interpreter so the runtime stage can copy
+    # site-packages directly via `COPY --from=builder`.
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1
+
+WORKDIR /build
+
+RUN pip install --upgrade pip attrs
+RUN pip install "poetry>=2.0.0,<3.0.0" "poetry-plugin-export>=1.9.0,<2.0.0"
+
+# Dependency layer. The exported requirements include the `embeddings`
+# group on top of `orchestration`, so the native BirdNET / Perch v2
+# embedding stack and kagglehub are baked into this image. The PyTorch
+# family and CUDA-related wheels are stripped because CPU-only PyTorch is
+# installed from the PyTorch index in the next step.
+COPY pyproject.toml poetry.lock ./
+RUN poetry export \
+    --format requirements.txt \
+    --without-hashes \
+    --without dev \
+    --with orchestration \
+    --with embeddings \
+    --output requirements.txt \
+    && grep -Eiv '^(torch|torchaudio|torchvision|triton|nvidia-|cuda-)' requirements.txt > requirements.docker.txt \
+    && pip install --no-cache-dir --retries 10 --timeout 300 -r requirements.docker.txt
+
+# CPU-only PyTorch from the official PyTorch index.
+RUN pip install --no-cache-dir --retries 10 --timeout 300 \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple
+
+# Install the project package itself into site-packages so Dagster's
+# spawned subprocesses do not depend on /app/src being first on sys.path.
+COPY README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir --no-deps --no-build-isolation .
+
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+# Runtime shared libraries:
+#
+#   libpq5    — psycopg2's libpq dependency at run time
+#   libgomp1  — OpenMP runtime required by numpy / torch wheels
+#   ffmpeg    — audio decoder used by feature-engineering and embedding paths
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    libgomp1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+RUN useradd --system --create-home --shell /bin/bash --uid 1001 appuser
+
+WORKDIR /app
+
+# Pull compiled site-packages and console-script entrypoints from the
+# builder stage.
+COPY --from=builder /usr/local/lib/python3.12/site-packages \
+    /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Ops helper invoked by the Docker HEALTHCHECK.
+COPY scripts/ops/dagster_healthcheck.py /usr/local/bin/dagster_healthcheck.py
+
+# Application source and configuration.
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Pre-create the directories that will be paired with host bind mounts.
+# Without this, Docker creates the missing paths as root on first boot,
+# which blocks `appuser` from writing alongside them.
+RUN mkdir -p /app/data/raw /app/data/processed /app/weights /opt/dagster_home/storage
+
+LABEL org.opencontainers.image.title="avian-biosurveillance-model"
+LABEL org.opencontainers.image.description="Avian Biosurveillance — Modeling and feature-engineering gRPC code-server"
+LABEL org.opencontainers.image.authors="Soheil Mohammadpour <soheil.mpg@gmail.com>"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.source="https://github.com/soheil-mp/avian-biosurveillance"
+
+RUN chmod 755 /usr/local/bin/dagster_healthcheck.py \
+    && chown -R appuser:appuser /app /opt/dagster_home
+
+USER appuser
+
+# Healthcheck issues a real Dagster gRPC round-trip rather than a plain
+# TCP probe, so Docker only reports healthy once the code location can
+# actually serve repository metadata. The larger start-period accounts
+# for the heavier ML import surface compared to the ingestion image.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python /usr/local/bin/dagster_healthcheck.py || exit 1
+
+CMD ["python", "-m", "avian_biosurveillance.orchestration.serve"]

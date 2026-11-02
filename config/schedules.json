@@ -1,0 +1,662 @@
+{
+    "_comment": "Per-deployment orchestration metadata for the Dagster layer. `enabled` controls the default on/off state of cron-backed entries and catchup sensors. `run_on_startup` controls the startup sensors. `execution_modes` declares how each deployment is triggered (`cron`, `startup`, `sensor`, `auto`, `manual`), and `depends_on` documents the intended upstream relationships even when the actual execution order is enforced by Dagster sensors or the asset graph. Species IDs are injected at runtime from target_species.json.",
+    "deployments": [
+        {
+            "_comment": "=== BIRDWEATHER (heaviest: bulk API + audio downloads) ===",
+            "name": "birdweather-daily",
+            "flow": "birdweather_ingest",
+            "cron": "0 0 * * *",
+            "tags": [
+                "daily",
+                "birdweather"
+            ],
+            "description": "BirdWeather local landing stage (last 24h). Fetches detections plus raw soundscapes into data/raw/birdweather so DB sync can retry independently of API collection.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "hours": 24,
+                "country": "Netherlands",
+                "min_confidence": 0.1,
+                "workers": 20,
+                "target": "local",
+                "download_audio": true
+            }
+        },
+        {
+            "name": "birdweather-bundle-sync",
+            "flow": "birdweather_bundle_sync",
+            "cron": "*/10 * * * *",
+            "tags": [
+                "post-processing",
+                "ingestion",
+                "birdweather",
+                "daily"
+            ],
+            "description": "Sensor-owned BirdWeather bundle sync. Consumes pending local date bundles from data/raw/birdweather into TimescaleDB and MinIO, then removes successfully synced bundles.",
+            "concurrency_limit": 1,
+            "enabled": true,
+            "run_on_startup": false,
+            "execution_modes": [
+                "sensor",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-daily"
+            ],
+            "parameters": {
+                "limit": 1,
+                "delete_on_success": true,
+                "output_dir": "data/raw/birdweather"
+            }
+        },
+        {
+            "name": "birdweather-repair",
+            "flow": "birdweather_repair",
+            "cron": "0 4 * * *",
+            "tags": [
+                "repair",
+                "birdweather"
+            ],
+            "description": "Manual BirdWeather range repair for missing days and optional raw-audio recovery. Kept for ad hoc source-specific fixes; the sensor-owned birdweather-catchup handles the continuous BirdWeather backlog.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "country": "Netherlands",
+                "all_species": false,
+                "min_confidence": 0.1,
+                "download_audio": true,
+                "workers": 20,
+                "target": "database"
+            }
+        },
+        {
+            "name": "birdweather-catchup",
+            "flow": "birdweather_catchup",
+            "cron": "0 4 * * *",
+            "tags": [
+                "catchup",
+                "historical",
+                "birdweather"
+            ],
+            "description": "Sensor-owned BirdWeather historical catchup. Launches chronological multi-day windows using `followup_batch_days`, batches audio and feature follow-up work over each window, and only requests the expensive species tracker rebuild on the final catchup window.",
+            "concurrency_limit": 1,
+            "enabled": true,
+            "run_on_startup": false,
+            "execution_modes": [
+                "sensor",
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "country": "Netherlands",
+                "all_species": false,
+                "min_confidence": 0.1,
+                "download_audio": true,
+                "followup_batch_days": 7,
+                "workers": 20,
+                "target": "database"
+            }
+        },
+        {
+            "_comment": "=== KNMI (moderate: EDR weather API) ===",
+            "name": "knmi-daily",
+            "flow": "knmi_ingest",
+            "cron": "30 0 * * *",
+            "tags": [
+                "daily",
+                "knmi"
+            ],
+            "description": "KNMI 10-min weather observations (last 26h with overlap).",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "hours_back": 26,
+                "target": "database"
+            }
+        },
+        {
+            "name": "knmi-repair",
+            "flow": "knmi_repair",
+            "cron": "30 4 * * *",
+            "tags": [
+                "repair",
+                "knmi"
+            ],
+            "description": "Manual KNMI date-range repair. Kept for ad hoc source-specific fixes; the sensor-owned historical-catchup handles the shared one-day startup backlog.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "target": "database",
+                "force": false
+            }
+        },
+        {
+            "_comment": "=== EBIRD (light: REST API calls) ===",
+            "name": "ebird-daily",
+            "flow": "ebird_ingest",
+            "cron": "0 1 * * *",
+            "tags": [
+                "daily",
+                "ebird"
+            ],
+            "description": "eBird recent observations for target species (last 3 days).",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "region": "NL",
+                "back": 3,
+                "target_species_only": true,
+                "target": "database"
+            }
+        },
+        {
+            "name": "ebird-repair",
+            "flow": "ebird_repair",
+            "cron": "0 5 * * *",
+            "tags": [
+                "repair",
+                "ebird"
+            ],
+            "description": "Manual eBird historic observation repair. Kept for ad hoc source-specific fixes; the sensor-owned historical-catchup handles the shared one-day startup backlog.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "region": "NL",
+                "target_species_only": true,
+                "target": "database"
+            }
+        },
+        {
+            "_comment": "=== MOVEBANK (moderate: GPS data download) ===",
+            "name": "movebank-daily",
+            "flow": "movebank_ingest",
+            "cron": "30 1 * * *",
+            "tags": [
+                "daily",
+                "movebank"
+            ],
+            "description": "Movebank GPS tracking events for target species (last 7 days).",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "lookback_days": 7,
+                "target": "database"
+            }
+        },
+        {
+            "name": "movebank-repair",
+            "flow": "movebank_repair",
+            "cron": "15 5 * * *",
+            "tags": [
+                "repair",
+                "movebank"
+            ],
+            "description": "Manual Movebank GPS tracking repair. Kept for ad hoc source-specific fixes; the sensor-owned historical-catchup handles the shared one-day startup backlog.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "all_sensors": true,
+                "target": "database"
+            }
+        },
+        {
+            "_comment": "=== SOVON (vision model: CPU-heavy chart extraction) ===",
+            "name": "sovon-daily",
+            "flow": "sovon_ingest",
+            "cron": "0 2 * * *",
+            "tags": [
+                "daily",
+                "sovon"
+            ],
+            "description": "Sovon mortality data: downloads and extracts all reports from 2000 to present. Runs on its daily cron only so local boot-time recovery does not contend with the Dagster code server.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "target": "database"
+            }
+        },
+        {
+            "_comment": "=== SEISMIC (very light: single FDSN query) ===",
+            "name": "seismic-daily",
+            "flow": "seismic_ingest",
+            "cron": "30 2 * * *",
+            "tags": [
+                "daily",
+                "seismic"
+            ],
+            "description": "KNMI FDSN seismic event ingestion (last 7 days).",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "days_back": 7,
+                "target": "database"
+            }
+        },
+        {
+            "name": "seismic-repair",
+            "flow": "seismic_repair",
+            "cron": "45 5 * * *",
+            "tags": [
+                "repair",
+                "seismic"
+            ],
+            "description": "Manual KNMI FDSN seismic event repair for an explicit historical date range.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "min_magnitude": 0.0,
+                "target": "database"
+            }
+        },
+        {
+            "name": "earth-engine-grid-daily",
+            "flow": "earth_engine_grid_ingest",
+            "cron": "0 3 1,15 * *",
+            "tags": [
+                "biweekly",
+                "earth-engine",
+                "grid"
+            ],
+            "description": "Google Earth Engine 5 km base-grid profiling for the Netherlands on a bi-weekly cadence (1st/15th anchors, ~30-day lookback to recover matured anchors).",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "lookback_days": 30,
+                "grid_size_km": 5.0,
+                "target": "database"
+            }
+        },
+        {
+            "name": "earth-engine-grid-repair",
+            "flow": "earth_engine_grid_repair",
+            "cron": "30 5 * * *",
+            "tags": [
+                "repair",
+                "earth-engine",
+                "grid"
+            ],
+            "description": "Manual Earth Engine 5 km base-grid repair. Kept for ad hoc source-specific fixes; the sensor-owned historical-catchup handles the shared one-day startup backlog.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "force": false,
+                "grid_size_km": 5.0,
+                "target": "database"
+            }
+        },
+        {
+            "name": "historical-catchup",
+            "flow": "historical_catchup",
+            "cron": "0 4 * * *",
+            "tags": [
+                "catchup",
+                "historical"
+            ],
+            "description": "Sensor-owned composite catchup for KNMI, eBird, and the Earth Engine grid. Launches chronological multi-day windows using `followup_batch_days`, batches shared follow-up work over each window, and only requests the expensive species tracker rebuild on the final catchup window.",
+            "concurrency_limit": 1,
+            "enabled": true,
+            "run_on_startup": false,
+            "execution_modes": [
+                "sensor",
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_date": "2024-01-01",
+                "end_date": "2025-12-31",
+                "bw_country": "Netherlands",
+                "bw_all_species": false,
+                "bw_min_confidence": 0.1,
+                "bw_workers": 20,
+                "bw_download_audio": true,
+                "followup_batch_days": 7,
+                "knmi_force": false,
+                "ebird_region": "NL",
+                "ebird_target_species_only": true,
+                "ee_grid_size_km": 5.0,
+                "ee_force": false,
+                "target": "database",
+                "sources": "knmi,ebird,earth_engine_grid"
+            }
+        },
+        {
+            "_comment": "=== CDS DROUGHT (monthly Copernicus drought grid) ===",
+            "name": "cds-drought-daily",
+            "flow": "cds_drought_ingest",
+            "cron": "40 3 * * *",
+            "tags": [
+                "daily",
+                "cds",
+                "drought",
+                "grid"
+            ],
+            "description": "Copernicus CDS ERA5-derived monthly drought ingestion for recent complete months.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "lookback_months": 4,
+                "include_ensemble_members": true,
+                "target": "database"
+            }
+        },
+        {
+            "name": "cds-drought-catchup",
+            "flow": "cds_drought_catchup",
+            "cron": "0 6 5 * *",
+            "tags": [
+                "catchup",
+                "cds",
+                "drought",
+                "grid"
+            ],
+            "description": "Cron/manual Copernicus CDS ERA5-derived monthly catchup for the previous month. Runs on the 5th of each month so ERA5 monthly aggregates are guaranteed to be published without adding boot-time load.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron",
+                "manual"
+            ],
+            "depends_on": [],
+            "parameters": {
+                "start_month": "2024-01",
+                "end_month": "2025-12",
+                "force": false,
+                "include_ensemble_members": true,
+                "target": "database"
+            }
+        },
+        {
+            "_comment": "=== POST-PROCESSING (run after all ingestion + catchup/repair completes) ===",
+            "name": "station-summary-refresh",
+            "flow": "station_summary_refresh",
+            "cron": "30 6 * * *",
+            "tags": [
+                "post-processing"
+            ],
+            "description": "Manual backstop for birdweather_stations_tbl aggregates (PL/pgSQL). Normally auto-materialized after BirdWeather ingestion or as part of the historical daily pipeline.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-bundle-sync",
+                "historical-catchup"
+            ],
+            "parameters": {}
+        },
+        {
+            "name": "derived-aggregates-refresh",
+            "flow": "derived_aggregates_refresh",
+            "cron": "45 6 * * *",
+            "tags": [
+                "post-processing"
+            ],
+            "description": "Manual backstop for species_tbl, movebank_tracks_tbl, and species_tracker_tbl. The asset graph normally auto-materializes these after their upstream ingestions and BirdWeather features land.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-bundle-sync",
+                "movebank-daily",
+                "sovon-daily",
+                "seismic-daily",
+                "earth-engine-grid-daily",
+                "cds-drought-daily",
+                "historical-catchup"
+            ],
+            "parameters": {
+                "max_points": 500
+            }
+        },
+        {
+            "name": "quality-audit",
+            "flow": "quality_audit",
+            "cron": "0 7 * * *",
+            "tags": [
+                "audit"
+            ],
+            "description": "Sensor/manual backstop for the ISO 25012 quality audit across all source tables. Normally launched by the daily-quality sensor after the daily ingestion cohort succeeds.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "sensor",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-bundle-sync",
+                "knmi-daily",
+                "ebird-daily",
+                "sovon-daily",
+                "seismic-daily",
+                "earth-engine-grid-daily",
+                "cds-drought-daily"
+            ],
+            "parameters": {}
+        },
+        {
+            "name": "birdweather-raw-audio-ingestion",
+            "flow": "birdweather_raw_audio_ingestion",
+            "cron": "5 7 * * *",
+            "tags": [
+                "post-processing",
+                "ingestion",
+                "birdweather",
+                "audio"
+            ],
+            "description": "Manual/auto materialization for queued BirdWeather raw soundscape downloads into MinIO raw-audio. Normally auto-materializes after BirdWeather bundle sync has landed new DB rows.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron",
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-bundle-sync"
+            ],
+            "parameters": {
+                "lookback_days": 2,
+                "limit": 1000,
+                "force": false,
+                "workers": 20
+            }
+        },
+        {
+            "name": "birdweather-audio-processing",
+            "flow": "birdweather_audio_processing",
+            "cron": "15 7 * * *",
+            "tags": [
+                "post-processing",
+                "processing",
+                "birdweather",
+                "audio"
+            ],
+            "description": "Manual/backstop materialization for BirdWeather cropped audio clips. The asset normally auto-materializes after raw audio objects land.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron",
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-raw-audio-ingestion"
+            ],
+            "parameters": {
+                "lookback_days": 2,
+                "limit": 1000,
+                "force": false
+            }
+        },
+        {
+            "name": "birdweather-feature-engineering",
+            "flow": "birdweather_feature_engineering",
+            "cron": "30 7 * * *",
+            "tags": [
+                "post-processing",
+                "features",
+                "birdweather",
+                "audio"
+            ],
+            "description": "Manual/backstop materialization for BirdWeather embeddings, background classifications, spectrograms, and waveforms. The asset normally auto-materializes after audio processing.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron",
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "birdweather-audio-processing"
+            ],
+            "parameters": {
+                "lookback_days": 2,
+                "limit": 500,
+                "force": false,
+                "background_device": "",
+                "background_top_k": 5,
+                "background_min_confidence": 0.1
+            }
+        },
+        {
+            "name": "model-anomaly-scoring",
+            "flow": "model_anomaly_scoring",
+            "cron": "15 8 * * *",
+            "tags": [
+                "modeling",
+                "daily",
+                "anomaly-scoring"
+            ],
+            "description": "Daily first-iteration modeling scorer for weekly species/location anomaly scores. Runs in the model code location after derived aggregates and audio features are refreshed.",
+            "concurrency_limit": 1,
+            "enabled": false,
+            "run_on_startup": false,
+            "execution_modes": [
+                "cron",
+                "auto",
+                "manual"
+            ],
+            "depends_on": [
+                "derived-aggregates-refresh",
+                "birdweather-feature-engineering"
+            ],
+            "parameters": {
+                "seasonal_window_weeks": 2,
+                "min_location_history": 20,
+                "min_seasonal_history": 8,
+                "min_observation_days": 3,
+                "target_species_only": true,
+                "include_embedding_drift": true,
+                "embedding_min_confidence": 0.1,
+                "embedding_min_baseline_clips": 50,
+                "embedding_min_week_clips": 3,
+                "embedding_k_neighbors": 10,
+                "embedding_cluster_min_samples": 2,
+                "embedding_cluster_distance_multiplier": 1.2,
+                "embedding_cluster_distance_floor": 0.03,
+                "embedding_cluster_distance_ceiling": 0.18,
+                "anomaly_min_model_rows": 20,
+                "anomaly_contamination": 0.05,
+                "anomaly_random_state": 42,
+                "amber_quantile": 0.95,
+                "red_quantile": 0.99
+            }
+        }
+    ]
+}

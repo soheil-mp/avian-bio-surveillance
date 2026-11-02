@@ -1,0 +1,90 @@
+# =============================================================================
+# .dockerignore — Avian Biosurveillance
+# =============================================================================
+# Excludes non-essential files from Docker build context to reduce
+# image size and build time.
+#
+# IMPORTANT: This file MUST live at the repository root because the Docker
+# build context is set to the repo root (context: ../..) in docker-compose.yml.
+# Docker only reads .dockerignore from the build context directory.
+# =============================================================================
+
+# --- Version control ---
+.git
+.gitignore
+.gitkeep
+
+# --- Python ---
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist
+build
+*.whl
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+.tox
+.venv
+venv
+
+# --- Node.js ---
+**/node_modules
+**/.next
+.turbo
+.vercel
+frontend/
+
+# --- IDE / Editor ---
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# --- Docker ---
+infrastructure/docker/.env.docker
+infrastructure/singularity
+
+# --- Database schemas (SQL DDL — not needed inside application images) ---
+db/
+
+# --- Data (large files, not needed in images) ---
+data/
+models/
+.checkpoints/
+weights/
+
+# --- Documentation & non-code ---
+docs
+resources
+*.md
+!README.md
+*.pdf
+*.drawio
+*.png
+*.jpg
+*.jpeg
+
+# --- Notebooks ---
+notebooks
+*.ipynb
+
+# --- Tests (test files and fixtures not needed in production images) ---
+tests
+
+# --- Scratch / ad-hoc scripts (not needed in images) ---
+_run_extraction.py
+_test_ollama.py
+_test_speed.py
+test_output.txt
+todo.md
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Keep secrets out of Git and the local encrypted backup fresh.
+#
+# Behaviour:
+#   - If .env, .env.enc, or .env.example is staged for commit, abort — env
+#     files must never be committed.
+#   - If .env changed since the last encrypt (mtime newer than .env.enc),
+#     re-run encrypt so the local, gitignored .env.enc backup stays current.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+# Hard-block accidental env-file commits.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qxE '\.env(\.enc|\.example)?'; then
+    echo "✗ pre-commit: an env file is staged — refusing to commit secrets." >&2
+    echo "  Unstage with: git reset HEAD .env .env.enc .env.example" >&2
+    exit 1
+fi
+
+# Skip if .env doesn't exist (fresh clone, CI, etc.).
+[ -f .env ] || exit 0
+
+# Re-encrypt only when .env is newer than .env.enc (or .env.enc is missing).
+if [ ! -f .env.enc ] || [ .env -nt .env.enc ]; then
+    echo "── pre-commit: .env changed — re-encrypting → .env.enc"
+    if command -v poetry >/dev/null 2>&1; then
+        poetry run python scripts/encryption/env_crypto.py encrypt
+    else
+        python scripts/encryption/env_crypto.py encrypt
+    fi
+fi

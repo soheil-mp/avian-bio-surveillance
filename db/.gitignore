@@ -1,0 +1,12 @@
+# Local-only artefacts
+*.log
+*.bak
+*.swp
+
+# psql session noise
+.psql_history
+
+# Generated documentation output (regenerate with `make erd`).
+# We currently keep erd/data_model.png checked in for offline viewing of the
+# audit; uncomment the next line to treat it as a build artefact instead.
+# erd/data_model.png

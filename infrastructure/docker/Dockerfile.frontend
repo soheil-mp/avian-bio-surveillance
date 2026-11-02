@@ -1,0 +1,108 @@
+# =============================================================================
+# Dockerfile.frontend — Next.js 15 dashboard image
+# =============================================================================
+# Builds the user-facing dashboard (Next.js 15 with MapLibre GL satellite
+# maps) and produces a minimal production runtime based on the Next.js
+# standalone output.
+#
+# The build is split into three stages:
+#
+#   1. deps    — install npm dependencies; layer cache keyed on
+#                package.json / package-lock.json
+#   2. builder — copy the source and run `next build` to produce the
+#                standalone server
+#   3. runner  — copy only the standalone output and static assets into a
+#                fresh image, run under a non-root user
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Stage 1 — deps
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS deps
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+
+
+# -----------------------------------------------------------------------------
+# Stage 2 — builder
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Pull the resolved node_modules from the deps stage and lay the source
+# on top.
+COPY --from=deps /app/node_modules ./node_modules
+COPY . ./
+
+# Build-time variables.
+#
+# `NEXT_PUBLIC_*` variables are inlined into the JavaScript bundle by
+# `next build`. With Next.js standalone output they cannot be overridden
+# at runtime, so they must be passed as build ARGs and must contain
+# browser-reachable URLs — never internal Docker hostnames.
+ARG NEXT_PUBLIC_DAGSTER_GRAPHQL_URL
+ENV NEXT_PUBLIC_DAGSTER_GRAPHQL_URL=$NEXT_PUBLIC_DAGSTER_GRAPHQL_URL
+
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+
+# -----------------------------------------------------------------------------
+# Stage 3 — runner
+# -----------------------------------------------------------------------------
+FROM node:22-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    APP_READY_FILE=/app/.runtime/species-tracker-ready
+
+# Non-root runtime user.
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+# Copy only what the standalone server needs: public assets, the
+# standalone build output, the static directory, and the entrypoint
+# script.
+#
+# `next.config.ts` sets `outputFileTracingRoot` to the workspace root (the
+# parent of the frontend source dir). Next.js mirrors the traced tree
+# relative to that root, so with the builder's WORKDIR at /app the server
+# lands in `.next/standalone/app/`, not at the top of `standalone/`.
+# Copying `standalone/` wholesale therefore produced /app/app/server.js
+# while the entrypoint ran `node server.js` from /app, leaving the
+# container with no server and no resolvable node_modules. Copy the
+# nested app directory so server.js, package.json, and the traced
+# node_modules land directly in /app.
+COPY --from=builder /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone/app ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --chown=nextjs:nodejs docker-entrypoint.sh ./docker-entrypoint.sh
+
+# Runtime scratch directory. The entrypoint writes the readiness flag
+# file here, which the healthcheck below tests for.
+RUN mkdir -p /app/.runtime \
+    && chown nextjs:nodejs /app/.runtime \
+    && chmod +x ./docker-entrypoint.sh
+
+USER nextjs
+
+LABEL org.opencontainers.image.title="avian-biosurveillance-frontend"
+LABEL org.opencontainers.image.description="Avian Biosurveillance — Next.js Dashboard (MapLibre GL satellite maps)"
+LABEL org.opencontainers.image.authors="Soheil Mohammadpour <soheil.mpg@gmail.com>"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.source="https://github.com/soheil-mp/avian-biosurveillance"
+
+# Readiness is gated on both the entrypoint's flag file and the health
+# endpoint responding, so the container only goes healthy after the
+# warm-up steps in docker-entrypoint.sh complete.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD test -f "$APP_READY_FILE" && wget --no-verbose --tries=1 --spider "http://127.0.0.1:${PORT}/api/health" || exit 1
+
+CMD ["./docker-entrypoint.sh"]

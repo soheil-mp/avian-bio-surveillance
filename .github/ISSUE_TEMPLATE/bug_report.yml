@@ -1,0 +1,87 @@
+name: "Bug Report"
+description: Report a bug to help us improve the project
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for taking the time to report a bug! Please search
+        [existing issues](https://github.com/soheil-mp/avian-biosurveillance/issues)
+        before filing a new one.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the bug...
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected-vs-actual-behavior
+    attributes:
+      label: Expected vs Actual Behavior
+      description: What you expected to happen vs what actually happened.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of the project is affected?
+      multiple: true
+      options:
+        - Ingestion
+        - Processing
+        - Feature Engineering
+        - Modeling
+        - Database
+        - Orchestration
+        - Infrastructure (e.g., Docker, CI/CD)
+        - Frontend / Dashboard
+        - Documentation
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Log Output
+      description: Copy and paste any relevant log output. This will be auto-formatted as code.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the behavior.
+      placeholder: |
+        1. Run `python -m avian_biosurveillance...`
+        2. With config...
+        3. See error...
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other context, screenshots, or data samples (redacted) about the problem.
+    validations:
+      required: false
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Branch naming convention:** When working on this issue, create a branch using:
+        ```
+        fix/<issue-number>-<short-description>
+        ```
+        Example: `fix/42-knmi-timeout`

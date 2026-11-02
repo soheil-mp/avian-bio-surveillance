@@ -1,0 +1,254 @@
+[project]
+name = "avian-biosurveillance"
+version = "0.1.0"
+description = "Detect avian disease outbreaks in real-time by analyzing bird calls and population patterns through machine learning"
+authors = [{ name = "Soheil", email = "soheil.mpg@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "MIT" }
+keywords = [
+    "avian",
+    "biosurveillance",
+    "bioacoustics",
+    "disease-detection",
+    "machine-learning",
+    "wildlife-monitoring",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "requests>=2.28",
+    "cdsapi>=0.7.7,<1",
+    "pandas>=2.1,<3",
+    "numpy>=1.26,<2.0.0",
+    "xarray>=2024.1,<2027",
+    "netCDF4>=1.7,<2",
+    "geopy>=2.4,<3",
+    "matplotlib>=3.8,<4",
+    "seaborn>=0.13,<1",
+    "scikit-learn>=1.4,<2",
+    "statsmodels>=0.14,<1",
+    "python-dotenv>=1.0",
+    "cryptography>=43.0",
+    "paho-mqtt>=2.0",
+    "asyncio-throttle>=1.0",
+    "tqdm>=4.66,<5",
+    "google-genai>=1.63,<2",
+    "psycopg2-binary>=2.9,<3",
+    "minio>=7.2,<8",
+    "librosa>=0.11,<0.12",
+    "noisereduce>=3.0,<4",
+    "soundfile>=0.13,<0.14",
+    "birdnetlib (>=0.18.0,<0.19.0)",
+    "transformers (>=5.3.0,<6.0.0)",
+    "earthengine-api (>=1.7.17,<2.0.0)",
+    "torch (>=2.1,<3)",
+    "torchaudio (>=2.1,<3)",
+    "torchvision (>=0.26,<1)",
+    "openpyxl (>=3.1,<4)",
+    "accelerate (>=1.1,<2)",
+]
+
+[project.urls]
+Repository = "https://github.com/soheil-mp/avian-biosurveillance"
+Issues = "https://github.com/soheil-mp/avian-biosurveillance/issues"
+
+[build-system]
+requires = ["poetry-core>=2.0,<3"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [{ include = "avian_biosurveillance", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+
+# === Orchestration (Dagster ETL worker) ===
+# Migrated from Prefect 3.x — see docs/adr/0001-migrate-prefect-to-dagster.md.
+
+[tool.poetry.group.orchestration.dependencies]
+dagster = { version = ">=1.9,<2", python = ">=3.11,<3.13" }
+dagster-webserver = { version = ">=1.9,<2", python = ">=3.11,<3.13" }
+dagster-postgres = { version = ">=0.25,<1", python = ">=3.11,<3.13" }
+dagster-graphql = { version = ">=1.9,<2", python = ">=3.11,<3.13" }
+sqlalchemy = ">=2.0,<3"
+httpx = ">=0.27,<1"
+
+# === Optional Audio Separation (Bird-MixIT) ===
+
+[tool.poetry.group.audio-separation]
+optional = true
+
+[tool.poetry.group.audio-separation.dependencies]
+tensorflow = { version = "~=2.15.0", markers = "python_version < '3.12'" }
+
+# tensorflow-hub remains in the optional audio-separation stack.
+tensorflow-hub = "^0.16.1"
+
+# === Native BirdNET / Perch v2 Embeddings ===
+
+[tool.poetry.group.embeddings]
+optional = true
+
+[tool.poetry.group.embeddings.dependencies]
+tensorflow-cpu = { version = ">=2.20,<2.21", markers = "platform_system == 'Linux' and python_version >= '3.12' and python_version < '3.13'" }
+kagglehub = ">=0.3,<0.4"
+
+# === GPU (CUDA) Embeddings runtime ===
+# Opt-in replacement for the CPU-only `embeddings` group. Installs the bundled
+# CUDA wheels so Perch v2 can run on an NVIDIA GPU. Requires the NVIDIA
+# Container Toolkit on the Docker host. Build the ingestion image with
+# `--build-arg EMBEDDINGS_GPU=1` to use this group instead of `embeddings`.
+
+[tool.poetry.group.embeddings-gpu]
+optional = true
+
+[tool.poetry.group.embeddings-gpu.dependencies]
+tensorflow = { version = ">=2.20,<2.21", extras = ["and-cuda"], markers = "platform_system == 'Linux' and python_version >= '3.12' and python_version < '3.13'" }
+kagglehub = ">=0.3,<0.4"
+
+# === Dev & Testing ===
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0,<9"
+pytest-cov = ">=5.0,<6"
+ruff = ">=0.4,<1"
+mypy = ">=1.10,<2"
+ipykernel = ">=7.0,<8"
+sphinx = "<9"
+sphinx-rtd-theme = ">=3.1,<4"
+sqlfluff = "^4.1.0"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+extend-exclude = ["notebooks", "data", "models", "*.ipynb"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade
+    "ARG",   # flake8-unused-arguments
+    "SIM",   # flake8-simplify
+    "PTH",   # flake8-use-pathlib
+    "PD",    # pandas-vet
+    "NPY",   # numpy-specific rules
+    "RUF",   # ruff-specific rules
+    "S",     # flake8-bandit (security)
+    "T20",   # flake8-print (catch debug prints)
+]
+ignore = [
+    "E501",   # line too long (formatter handles this)
+    "S101",   # assert usage (fine in tests)
+    "PD901",  # df as variable name (common in data science)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["avian_biosurveillance"]
+force-single-line = false
+lines-after-imports = 2
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]              # unused imports in __init__
+"tests/**/*.py" = ["S101", "ARG001"]  # asserts and fixtures allowed
+"notebooks/**/*.py" = ["T20", "E402"] # prints and import order in notebooks
+
+# === Testing ===
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+norecursedirs = [
+    "data",
+    "models",
+    "notebooks",
+    "scripts",
+    "docs",
+    "infrastructure",
+    "frontend",
+    "resources",
+    "DB",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+]
+addopts = [
+    "-ra",
+    "-q",
+    "--strict-markers",
+    "--strict-config",
+    "--import-mode=importlib",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests requiring external services",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["avian_biosurveillance"]
+branch = true
+parallel = true
+omit = ["tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "raise AssertionError",
+    "@abstractmethod",
+    "\\.\\.\\.",
+]
+
+# === Type Checking ===
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+pretty = true
+show_error_codes = true
+plugins = ["numpy.typing.mypy_plugin"]
+
+[[tool.mypy.overrides]]
+module = [
+    "sklearn.*",
+    "statsmodels.*",
+    "seaborn.*",
+    "geopy.*",
+    "matplotlib.*",
+    "pandas.*",
+]
+ignore_missing_imports = true

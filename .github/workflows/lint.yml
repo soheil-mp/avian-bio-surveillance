@@ -1,0 +1,66 @@
+name: Lint and Format
+
+on:
+#   push:
+#     branches: [ "master" ]
+#   pull_request:
+#     branches: [ "master" ]
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Generate poetry.lock
+        run: poetry lock
+
+      - name: Load cached venv
+        id: cached-poetry-dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+
+      - name: Install dependencies
+        if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
+
+      - name: Run Ruff Check (Lint)
+        run: poetry run ruff check .
+        continue-on-error: true
+
+      - name: Run Ruff Format (Check)
+        run: poetry run ruff format --check .
+        continue-on-error: true
+
+      - name: Run Mypy
+        run: poetry run mypy .
+        continue-on-error: true
+
+      - name: Install SQLFluff
+        run: poetry run python -m pip install sqlfluff
+
+      - name: Run SQLFluff
+        run: poetry run sqlfluff lint db/ --dialect postgres

@@ -1,0 +1,166 @@
+# =============================================================================
+# Dockerfile.ingestion — ingestion / ETL gRPC code-server image
+# =============================================================================
+# Runtime for the project's data-ingestion and transformation flows. The
+# container exposes the project's Dagster `defs` over a gRPC code-server
+# so the host's Dagster webserver and daemon can load them remotely.
+#
+# Two-stage build:
+#
+#   1. builder — install build dependencies and compile native wheels
+#                (psycopg2) into the system site-packages
+#   2. runtime — copy only the compiled site-packages, the application
+#                source, and runtime libraries; build tools are dropped
+#
+# The gRPC bind host and port are resolved at startup from environment
+# variables defined in `config/runtime.env`.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Stage 1 — builder
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+# Embeddings runtime selector. `0` (default) installs the CPU-only TensorFlow
+# build via the `embeddings` group. `1` installs `tensorflow[and-cuda]` via the
+# `embeddings-gpu` group so Perch v2 can run on an NVIDIA GPU. The GPU build
+# additionally requires the NVIDIA Container Toolkit on the Docker host and
+# `gpus: all` (see docker-compose.gpu.yml).
+ARG EMBEDDINGS_GPU=0
+
+# Build-time toolchain. `libpq-dev` is required to compile psycopg2
+# against the matching libpq major version.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    # Install into the system interpreter so the runtime stage can copy
+    # site-packages directly via `COPY --from=builder`. A virtualenv would
+    # add a path-resolution step we do not need.
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1
+
+WORKDIR /build
+
+RUN pip install --upgrade pip attrs
+RUN pip install "poetry>=2.0.0,<3.0.0" "poetry-plugin-export>=1.9.0,<2.0.0"
+
+# Dependency layer. The Docker cache for this step is invalidated only
+# when pyproject.toml or poetry.lock changes, so committing poetry.lock is
+# required for deterministic, cache-friendly builds.
+#
+# BirdWeather historical catchup still executes raw-audio, clip-processing,
+# and feature-engineering follow-up work inline inside the ingestion worker.
+# Include the optional `embeddings` group here so that catchup-triggered
+# feature engineering can compute BirdNET / Perch vectors instead of
+# persisting `backend_unavailable` manifests when TensorFlow is absent.
+#
+# The PyTorch family and CUDA-related wheels are stripped from the
+# exported requirements file because we install the CPU-only PyTorch from
+# the PyTorch index in the next step. Allowing Poetry's default
+# resolution would pull the GPU/NVIDIA build and bloat the image.
+#
+# When EMBEDDINGS_GPU=1 the `embeddings-gpu` group is exported instead and
+# the nvidia-*/cuda-* wheels (TensorFlow's CUDA runtime) are preserved; only
+# the PyTorch family is stripped so CPU torch can be installed separately.
+COPY pyproject.toml poetry.lock ./
+RUN if [ "$EMBEDDINGS_GPU" = "1" ]; then \
+        EMB_GROUP=embeddings-gpu; \
+        STRIP_PATTERN='^(torch|torchaudio|torchvision)'; \
+    else \
+        EMB_GROUP=embeddings; \
+        STRIP_PATTERN='^(torch|torchaudio|torchvision|triton|nvidia-|cuda-)'; \
+    fi \
+    && poetry export \
+        --format requirements.txt \
+        --without-hashes \
+        --without dev \
+        --with orchestration \
+        --with "$EMB_GROUP" \
+        --output requirements.txt \
+    && grep -Eiv "$STRIP_PATTERN" requirements.txt > requirements.docker.txt \
+    && pip install --no-cache-dir --retries 10 --timeout 300 -r requirements.docker.txt
+
+# CPU-only PyTorch from the official PyTorch index.
+RUN pip install --no-cache-dir --retries 10 --timeout 300 \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple
+
+# Install the project package itself into site-packages so Dagster's
+# spawned subprocesses do not depend on /app/src being first on sys.path.
+COPY README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir --no-deps --no-build-isolation .
+
+
+# -----------------------------------------------------------------------------
+# Stage 2 — runtime
+# -----------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+# Runtime shared libraries:
+#
+#   libpq5    — psycopg2's libpq dependency at run time
+#   libgomp1  — OpenMP runtime required by numpy / torch wheels
+#   ffmpeg    — universal audio decoder used as a fallback path in
+#               feature extraction and background-sound classification
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    libgomp1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src
+
+RUN useradd --system --create-home --shell /bin/bash --uid 1001 appuser
+
+WORKDIR /app
+
+# Pull compiled site-packages and console-script entrypoints from the
+# builder stage.
+COPY --from=builder /usr/local/lib/python3.12/site-packages \
+    /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Ops helpers invoked by the Compose `command` and the Docker HEALTHCHECK.
+COPY scripts/ops/dagster_healthcheck.py /usr/local/bin/dagster_healthcheck.py
+COPY scripts/ops/dagster_reconcile_run_state.py /usr/local/bin/dagster_reconcile_run_state.py
+
+# Application source and configuration.
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Pre-create the directories that will be paired with host bind mounts.
+# Without this, Docker creates the missing paths as root on first boot,
+# which blocks `appuser` from writing alongside them (for example,
+# creating `data/raw/` next to a root-owned `data/reference/`).
+RUN mkdir -p /app/data/raw /app/data/processed /app/weights /opt/dagster_home/storage
+
+LABEL org.opencontainers.image.title="avian-biosurveillance-ingestion"
+LABEL org.opencontainers.image.description="Avian Biosurveillance — Ingestion (Dagster ETL worker / gRPC code-server)"
+LABEL org.opencontainers.image.authors="Soheil Mohammadpour <soheil.mpg@gmail.com>"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.source="https://github.com/soheil-mp/avian-biosurveillance"
+
+RUN chmod 755 /usr/local/bin/dagster_reconcile_run_state.py /usr/local/bin/dagster_healthcheck.py \
+    && chown -R appuser:appuser /app /opt/dagster_home
+
+USER appuser
+
+# Healthcheck issues a real Dagster gRPC round-trip rather than a plain
+# TCP probe, so Docker only reports healthy once the code location can
+# actually serve repository metadata.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD python /usr/local/bin/dagster_healthcheck.py || exit 1
+
+CMD ["python", "-m", "avian_biosurveillance.orchestration.serve"]

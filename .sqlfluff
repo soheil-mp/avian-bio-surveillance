@@ -1,0 +1,32 @@
+[sqlfluff]
+dialect = postgres
+templater = raw
+large_file_skip_byte_limit = 30000
+exclude_rules =
+    # PostgreSQL function bodies (`$$ ... $$`) confuse the parser; rules that
+    # complain about indentation inside them produce noise.
+    L003,
+    # Allow trailing comma rule to be enforced by reviewer judgement, not lint.
+    L019
+
+max_line_length = 120
+
+[sqlfluff:indentation]
+indented_joins = false
+indented_using_on = true
+template_blocks_indent = false
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = upper
+
+[sqlfluff:rules:capitalisation.identifiers]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+capitalisation_policy = upper

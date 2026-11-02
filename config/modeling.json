@@ -1,0 +1,42 @@
+{
+    "_comment": "Lean configuration for unsupervised bird-behavior anomaly modeling. The model loads all available modeled rows; retrospective windows are selected during evaluation/reporting, not by CURRENT_DATE filters.",
+    "feature_set": {
+        "target_species_only": true,
+        "seasonal_window_weeks": 2,
+        "min_observation_days": 3,
+        "min_location_history": 20,
+        "min_seasonal_history": 8,
+        "min_station_availability_ratio": 0.5,
+        "min_station_baseline_history": 4,
+        "population_activity_components": [
+            "relative_abundance_pct",
+            "temporal_occupancy_pct",
+            "station_presence_pct",
+            "detections_per_active_station_day"
+        ]
+    },
+    "embedding_drift": {
+        "include_embedding_drift": true,
+        "include_embedding_control": true,
+        "min_control_species": 1,
+        "min_confidence": 0.1,
+        "min_baseline_clips": 50,
+        "min_week_clips": 3,
+        "k_neighbors": 10,
+        "top_clip_count": 5,
+        "cluster_min_samples": 2,
+        "cluster_distance_multiplier": 1.2,
+        "cluster_distance_floor": 0.03,
+        "cluster_distance_ceiling": 0.18,
+        "background_summary_top_k": 3
+    },
+    "anomaly_model": {
+        "min_model_rows": 20,
+        "contamination": 0.05,
+        "random_state": 42,
+        "amber_quantile": 0.95,
+        "red_quantile": 0.99,
+        "_include_environmental_comment": "Add curated environmental context (temp/precip/soil-moisture/NDVI/drought lags) to the fusion anomaly matrix. Keep false until KNMI/GEE backfills populate the modeling window; the acoustic+population streams remain the spine.",
+        "include_environmental": false
+    }
+}

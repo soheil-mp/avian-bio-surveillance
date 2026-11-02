@@ -1,0 +1,17 @@
+# --- Node.js build artifacts ---
+node_modules
+.next
+
+# --- Tooling caches ---
+.turbo
+.vercel
+
+# --- Local development files ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env*
+
+# --- Editor / OS ---
+.DS_Store
+Thumbs.db

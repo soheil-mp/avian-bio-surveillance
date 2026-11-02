@@ -1,0 +1,243 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap");
+@import "tailwindcss";
+
+/*
+ * MapLibre GL requires its stylesheet for controls and popups.
+ * We import it here so it's available app-wide.
+ */
+@import "maplibre-gl/dist/maplibre-gl.css";
+
+/* ──────────────────────────────────────────────
+   Design tokens
+   ────────────────────────────────────────────── */
+@theme {
+  --color-brand-50: #ecfdf5;
+  --color-brand-100: #d1fae5;
+  --color-brand-200: #a7f3d0;
+  --color-brand-300: #6ee7b7;
+  --color-brand-400: #34d399;
+  --color-brand-500: #10b981;
+  --color-brand-600: #059669;
+  --color-brand-700: #047857;
+  --color-brand-800: #065f46;
+  --color-brand-900: #064e3b;
+
+  --color-accent-amber: #fbbf24;
+  --color-accent-blue: #38bdf8;
+  --color-accent-red: #dc2626;
+
+  --color-surface-primary: #111111;
+  --color-surface-secondary: #1a1a1a;
+  --color-surface-elevated: #262626;
+
+  --color-text-primary: #f0f4f8;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+
+  --color-border-default: #1e293b;
+  --color-border-subtle: #334155;
+
+  --animate-radar-scan: radar-scan 8s linear infinite;
+  --animate-glow-pulse: glow-pulse 4s ease-in-out infinite;
+}
+
+/* ──────────────────────────────────────────────
+   Base reset
+   ────────────────────────────────────────────── */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background-color: #0c0c0c;
+  color: var(--color-text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+:root {
+  --sidebar-w: 0px;
+}
+
+@media (min-width: 768px) {
+  :root {
+    --sidebar-w: 88px;
+  }
+}
+
+/* ──────────────────────────────────────────────
+   Scope viewport sizing
+   Responsive circle that fills almost the entire space.
+   ────────────────────────────────────────────── */
+.scope-size {
+  --scope: min(calc(100vh - 120px), calc(100vw - var(--sidebar-w, 88px) - 120px), 1400px);
+  width: var(--scope);
+  height: var(--scope);
+}
+
+/* ──────────────────────────────────────────────
+   Hero background
+   Deep dark with a subtle radial glow at center
+   and a faint dot-grid pattern for technical feel.
+   ────────────────────────────────────────────── */
+.hero-bg {
+  background-color: var(--color-surface-primary);
+  background-image:
+    radial-gradient(ellipse at center, rgba(16, 185, 129, 0.03) 0%, transparent 60%),
+    radial-gradient(rgba(16, 185, 129, 0.04) 1px, transparent 1px);
+  background-size: 100% 100%, 30px 30px;
+}
+
+/* ──────────────────────────────────────────────
+   Illustrative overlays
+   ────────────────────────────────────────────── */
+.scanlines {
+  background: linear-gradient(to bottom,
+      rgba(255, 255, 255, 0),
+      rgba(255, 255, 255, 0) 50%,
+      rgba(0, 0, 0, 0.3) 50%,
+      rgba(0, 0, 0, 0.3));
+  background-size: 100% 4px;
+}
+
+/* ──────────────────────────────────────────────
+   Keyframe animations
+   ────────────────────────────────────────────── */
+@keyframes radar-scan {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes glow-pulse {
+
+  0%,
+  100% {
+    box-shadow:
+      0 0 18px rgba(16, 185, 129, 0.10),
+      0 0 45px rgba(16, 185, 129, 0.05),
+      0 0 90px rgba(16, 185, 129, 0.025);
+  }
+
+  50% {
+    box-shadow:
+      0 0 28px rgba(16, 185, 129, 0.20),
+      0 0 65px rgba(16, 185, 129, 0.09),
+      0 0 110px rgba(16, 185, 129, 0.04);
+  }
+}
+
+@keyframes boot-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes boot-cursor-blink {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ── Movebank bird Markers — static top-down silhouette ── */
+/**
+ * Black bird artwork rendered from /icons/bird-flying.svg.
+ * The surrounding div handles bearing rotation; no wing animation.
+ */
+.movebank-bird-marker {
+  display: block;
+  pointer-events: none;
+}
+
+/* ──────────────────────────────────────────────
+   MapLibre overrides (dark theme)
+   ────────────────────────────────────────────── */
+.maplibregl-ctrl-group {
+  background-color: var(--color-surface-elevated) !important;
+  border-color: var(--color-border-subtle) !important;
+}
+
+.maplibregl-ctrl-group button {
+  filter: invert(1);
+}
+
+.maplibregl-ctrl-attrib {
+  background-color: rgba(17, 17, 17, 0.7) !important;
+  color: var(--color-text-muted) !important;
+  font-size: 0.6rem !important;
+}
+
+.maplibregl-ctrl-attrib a {
+  color: var(--color-text-secondary) !important;
+}
+
+/* ──────────────────────────────────────────────
+   Custom Popup overrides
+   ────────────────────────────────────────────── */
+.station-popup .maplibregl-popup-content {
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+}
+
+.station-popup .maplibregl-popup-tip {
+  border-top-color: var(--color-brand-500) !important;
+  opacity: 0.3;
+}
+
+.station-popup .maplibregl-popup-close-button {
+  color: var(--color-text-muted);
+  right: 8px;
+  top: 8px;
+  font-size: 14px;
+  line-height: 1;
+  transition: color 0.2s;
+  z-index: 10;
+}
+
+.station-popup .maplibregl-popup-close-button:hover {
+  color: var(--color-brand-400);
+  background: transparent;
+}
+
+/* ──────────────────────────────────────────────
+   Left sidebar — faint noise texture overlay
+   Width is JS-controlled via inline style in Navbar.tsx
+   ────────────────────────────────────────────── */
+
+/* Extra polish: faint noise texture on sidebar */
+.sidebar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='rgba(255,255,255,0.015)'/%3E%3C/svg%3E");
+  background-size: 4px 4px;
+}
+
+.sidebar::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 22%, transparent 78%, rgba(255, 255, 255, 0.02));
+}
+

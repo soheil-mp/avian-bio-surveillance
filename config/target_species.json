@@ -1,0 +1,115 @@
+{
+    "_comment": "Single source of truth for the tracked target species (SDD §1.2). All consumers read from this file — never hardcode species elsewhere.",
+    "species": [
+        {
+            "english": "Eurasian Blackbird",
+            "dutch": "Merel",
+            "scientific": "Turdus merula",
+            "sovon_id": 11870,
+            "birdweather_id": 35,
+            "ebird_code": "eurbla",
+            "recommended threshold": 0.363,
+            "movebank_taxon": "Turdus merula"
+        },
+        {
+            "english": "Song Thrush",
+            "dutch": "Zanglijster",
+            "scientific": "Turdus philomelos",
+            "sovon_id": 12000,
+            "birdweather_id": 61,
+            "ebird_code": "sonthr1",
+            "recommended threshold": 0.461,
+            "movebank_taxon": "Turdus philomelos"
+        },
+        {
+            "english": "Dunnock",
+            "dutch": "Heggenmus",
+            "scientific": "Prunella modularis",
+            "sovon_id": 10840,
+            "birdweather_id": 44,
+            "ebird_code": "dunnoc1",
+            "recommended threshold": 0.491,
+            "movebank_taxon": "Prunella modularis"
+        },
+        {
+            "english": "Eurasian Wren",
+            "dutch": "Winterkoning",
+            "scientific": "Troglodytes troglodytes",
+            "sovon_id": 10660,
+            "birdweather_id": 5,
+            "ebird_code": "winwre4",
+            "recommended threshold": 0.407,
+            "movebank_taxon": "Troglodytes troglodytes"
+        },
+        {
+            "english": "European Robin",
+            "dutch": "Roodborst",
+            "scientific": "Erithacus rubecula",
+            "sovon_id": 10990,
+            "birdweather_id": 6,
+            "ebird_code": "eurrob1",
+            "recommended threshold": 0.566,
+            "movebank_taxon": "Erithacus rubecula"
+        },
+        {
+            "english": "Eurasian Blackcap",
+            "dutch": "Zwartkop",
+            "scientific": "Sylvia atricapilla",
+            "sovon_id": 12770,
+            "birdweather_id": 62,
+            "ebird_code": "blackc1",
+            "recommended threshold": 0.164,
+            "movebank_taxon": "Sylvia atricapilla"
+        },
+        {
+            "english": "Willow Warbler",
+            "dutch": "Fitis",
+            "scientific": "Phylloscopus trochilus",
+            "sovon_id": 13120,
+            "birdweather_id": 81,
+            "ebird_code": "wlwwar",
+            "recommended threshold": 0.85,
+            "movebank_taxon": "Phylloscopus trochilus"
+        },
+        {
+            "english": "Common Chaffinch",
+            "dutch": "Vink",
+            "scientific": "Fringilla coelebs",
+            "sovon_id": 16360,
+            "birdweather_id": 25,
+            "ebird_code": "comcha",
+            "recommended threshold": 0.196,
+            "movebank_taxon": "Fringilla coelebs"
+        },
+        {
+            "english": "Western Jackdaw",
+            "dutch": "Kauw",
+            "scientific": "Coloeus monedula",
+            "sovon_id": 15600,
+            "birdweather_id": 76,
+            "ebird_code": "eurjac",
+            "recommended threshold": 0.85,
+            "movebank_taxon": "Coloeus monedula"
+        },
+        {
+            "english": "Common Wood-Pigeon",
+            "dutch": "Houtduif",
+            "scientific": "Columba palumbus",
+            "sovon_id": 6700,
+            "birdweather_id": 407,
+            "ebird_code": "cowpig1",
+            "recommended threshold": 0.85,
+            "movebank_taxon": "Columba palumbus"
+        },
+        {
+            "english": "Eurasian Blue Tit",
+            "dutch": "Pimpelmees",
+            "scientific": "Cyanistes caeruleus",
+            "sovon_id": 14620,
+            "birdweather_id": 66,
+            "ebird_code": "blutit",
+            "recommended threshold": 0.615,
+            "movebank_taxon": "Cyanistes caeruleus"
+        }
+    ]
+}

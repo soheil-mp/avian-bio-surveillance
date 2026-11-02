@@ -1,0 +1,1099 @@
+# =============================================================================
+# Docker Compose — Avian Biosurveillance Platform
+# =============================================================================
+# Local development stack. The services in this file are:
+#
+#   * dagster-home-init  — one-shot filesystem-ownership prep for the
+#                          shared Dagster home directory
+#   * timescaledb        — PostgreSQL 16 with the TimescaleDB extension
+#   * timescaledb-init   — idempotent schema bootstrap sidecar
+#   * autoheal           — restart-on-unhealthy controller
+#   * minio              — S3-compatible object storage
+#   * minio-init         — bucket creation and scoped-user provisioning
+#   * dagster-webserver  — Dagster UI and GraphQL API
+#   * dagster-daemon     — schedules, sensors, and run coordination
+#   * ingestion          — Dagster gRPC code-server for ETL flows
+#   * model              — Dagster gRPC code-server for ML and features
+#   * frontend           — Next.js 15 dashboard
+#
+# All container names are prefixed `ab-`. All published ports are bound
+# to 127.0.0.1 and are not reachable from the host network. Resource
+# limits are tuned for a ~16 GiB development machine; if a single
+# service needs more headroom, the `ingestion` code-server is almost
+# always the right place to start.
+#
+# Usage (from the repository root):
+#
+#   bash infrastructure/docker/compose.sh up -d
+#   bash infrastructure/docker/compose.sh ps
+#   bash infrastructure/docker/compose.sh logs -f ingestion model
+#   bash infrastructure/docker/compose.sh down
+#
+# See infrastructure/docker/README.md for the operational reference,
+# including DNS troubleshooting and the full resource-limit matrix.
+# =============================================================================
+
+name: avian-biosurveillance
+
+volumes:
+  # Postgres data directory for both the application schema and the
+  # isolated `dagster_db` orchestration database.
+  timescaledb-data:
+    driver: local
+  # MinIO object store for raw audio, processed audio, and feature artifacts.
+  minio-data:
+    driver: local
+  # Persisted ETL raw/cache artifacts (e.g. Sovon historical chart and JSON
+  # caches) that should survive container rebuilds.
+  ingestion-raw-data:
+    driver: local
+
+networks:
+  avian-net:
+    driver: bridge
+
+# YAML anchors reused across services for consistent log rotation,
+# privilege drop, and timezone propagation.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# Prevents setuid/setgid privilege escalation in all long-running containers.
+x-security: &default-security
+  - no-new-privileges:true
+
+x-timezone-env: &default-timezone-env
+  TZ: ${AVIAN_TIMEZONE:-Europe/Amsterdam}
+
+# Caps native-library thread pools. Without these, NumPy/BLAS/TensorFlow size
+# their pools from the HOST core count (os.cpu_count() ignores the cgroup CPU
+# quota), so a container limited to 2.0 CPUs would still spawn ~16 threads and
+# thrash. Values are matched to the `cpus:` limit of the services that use them.
+x-thread-caps: &thread-caps
+  OMP_NUM_THREADS: ${AVIAN_OMP_NUM_THREADS:-2}
+  OPENBLAS_NUM_THREADS: ${AVIAN_OPENBLAS_NUM_THREADS:-2}
+  MKL_NUM_THREADS: ${AVIAN_MKL_NUM_THREADS:-2}
+  NUMEXPR_NUM_THREADS: ${AVIAN_NUMEXPR_NUM_THREADS:-2}
+  VECLIB_MAXIMUM_THREADS: ${AVIAN_VECLIB_MAXIMUM_THREADS:-2}
+  TF_NUM_INTRAOP_THREADS: ${AVIAN_TF_NUM_INTRAOP_THREADS:-2}
+  TF_NUM_INTEROP_THREADS: ${AVIAN_TF_NUM_INTEROP_THREADS:-1}
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # dagster-home-init — filesystem ownership prep for the Dagster home dir
+  # ---------------------------------------------------------------------------
+  # Dagster step workers inside the non-root ingestion and model
+  # containers write compute logs and SQLite artifacts under
+  # /opt/dagster_home/storage. The host bind mount is created as
+  # root by Docker, so this short init job normalises ownership to the
+  # non-root runtime UID/GID (1001:1001) before the long-running Dagster
+  # services start.
+  #
+  # The .cache directory is intentionally skipped: HuggingFace and other
+  # large runtime caches live there, and some Docker bind-mount backends
+  # refuse recursive chown on downloaded cache artifacts. Including it
+  # would cause `docker compose up` to fail during routine rebuilds.
+  # ---------------------------------------------------------------------------
+  dagster-home-init:
+    pull_policy: never
+    image: avian-biosurveillance/dagster:1.9
+    container_name: ab-dagster-home-init
+    user: "0:0"
+    restart: "no"
+    logging: *default-logging
+    security_opt: *default-security
+    environment:
+      <<: *default-timezone-env
+    command:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /opt/dagster_home/storage /opt/dagster_home/.logs_queue
+        chown 1001:1001 /opt/dagster_home
+        find /opt/dagster_home -mindepth 1 \
+          \( -path /opt/dagster_home/.cache -o -path '/opt/dagster_home/.cache/*' \) -prune \
+          -o -exec chown 1001:1001 {} +
+    volumes:
+      - ../../data/dagster_home:/opt/dagster_home
+
+  # ---------------------------------------------------------------------------
+  # timescaledb — PostgreSQL 16 + TimescaleDB extension
+  # ---------------------------------------------------------------------------
+  # Single Postgres instance hosting both the `avian_biosurveillance`
+  # application schema (hypertables, continuous aggregates, source and
+  # derived tables) and the `dagster_db` orchestration metadata database.
+  # Hypertables use 1-day chunks; see db/README.md for the full schema
+  # layout.
+  # ---------------------------------------------------------------------------
+  timescaledb:
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: ab-timescaledb
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "1.0"
+    mem_limit: "1536m"
+    mem_reservation: "512m"
+    command: postgres -c max_connections=40 -c shared_buffers=256MB -c log_timezone=${AVIAN_TIMEZONE:-Europe/Amsterdam}
+    environment:
+      <<: *default-timezone-env
+      POSTGRES_DB: ${POSTGRES_DB:-avian_biosurveillance}
+      POSTGRES_USER: ${POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "${AVIAN_BIND_HOST:?AVIAN_BIND_HOST is required}:${TSDB_PORT:?TSDB_PORT is required}:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      # Schema is intentionally NOT loaded via /docker-entrypoint-initdb.d/.
+      # The `timescaledb-init` sidecar below runs db/bootstrap/init_database.sh
+      # on every boot and is the single source of truth for schema load
+      # order; binding init scripts here would cause drift between fresh
+      # and replayed volumes.
+    networks:
+      - avian-net
+    healthcheck:
+      # `pg_isready` returns ready during PITR recovery before the server
+      # accepts new connections, so a real query is used instead. This
+      # ensures the Dagster Postgres pool only connects once the database
+      # is fully up.
+      test: ["CMD-SHELL", "psql -U ${POSTGRES_USER:-root} -d ${POSTGRES_DB:-avian_biosurveillance} -tAc 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # timescaledb-init — idempotent database bootstrap (runs every boot)
+  # ---------------------------------------------------------------------------
+  # PostgreSQL only runs /docker-entrypoint-initdb.d/ on an empty data
+  # directory, so this sidecar exists to (re-)apply
+  # db/bootstrap/init_database.sh against the live database on every
+  # container start. The bootstrap is fully idempotent: extensions, tables,
+  # views, and continuous aggregates use IF NOT EXISTS or CREATE OR REPLACE,
+  # and one-way migrations are tracked in `schema_migrations_tbl`.
+  #
+  # The image must be Debian-based — `ensure_aux_roles.sh` requires bash
+  # (`set -o pipefail`). The Alpine `postgres` variant ships sh, not bash,
+  # and exits 126 against this script.
+  # ---------------------------------------------------------------------------
+  timescaledb-init:
+    image: postgres:16-bookworm
+    container_name: ab-timescaledb-init
+    restart: "no"
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.25"
+    mem_limit: "128m"
+    mem_reservation: "64m"
+    environment:
+      <<: *default-timezone-env
+      PGHOST: timescaledb
+      PGPORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      PGUSER: ${POSTGRES_USER:-root}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-avian_biosurveillance}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - avian-net
+    volumes:
+      - ../../db:/init/db:ro
+    entrypoint: ["bash", "/init/db/bootstrap/init_database.sh"]
+
+  # ---------------------------------------------------------------------------
+  # autoheal — restart containers whose Docker healthcheck turns unhealthy
+  # ---------------------------------------------------------------------------
+  # Docker restart policies only fire on process exit; a container that
+  # is running but reports unhealthy (for example, MinIO with
+  # `drives-online: 0`) is never restarted automatically. Autoheal polls
+  # the Docker daemon every 30 s and issues a `docker restart` against
+  # any container labelled `autoheal=true` whose health status is
+  # "unhealthy". The Docker socket is the only required privilege.
+  # ---------------------------------------------------------------------------
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    container_name: ab-autoheal
+    restart: unless-stopped
+    logging: *default-logging
+    cpus: "0.1"
+    mem_limit: "64m"
+    mem_reservation: "32m"
+    environment:
+      <<: *default-timezone-env
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - avian-net
+
+  # ---------------------------------------------------------------------------
+  # minio — S3-compatible object storage
+  # ---------------------------------------------------------------------------
+  # Hosts three buckets used by the platform:
+  #
+  #   * raw-audio       — verbatim BirdWeather media downloads
+  #   * processed-audio — cropped FLAC clips produced by audio processing
+  #   * features        — spectrogram and waveform PNG artifacts
+  #
+  # Bucket creation and the scoped application user are provisioned by
+  # the `minio-init` sidecar below. MinIO intentionally does not carry
+  # the `autoheal=true` label: when Docker's exec layer is degraded,
+  # healthchecks can fail even while the service remains reachable from
+  # other containers, and autoheal would turn that false negative into a
+  # real outage by restarting object storage during backlog work. Use the
+  # targeted MinIO recovery helper instead. The default repo-relative
+  # data bind mount keeps the single-container MinIO path portable across
+  # laptop and server clones of the same repository; set
+  # MINIO_DATA_MOUNT to switch MinIO onto Docker-managed storage without
+  # changing bucket names or application credentials.
+  # ---------------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: ab-minio
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.5"
+    mem_limit: "768m"
+    mem_reservation: "256m"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    command: server /data --console-address ":9001"
+    environment:
+      <<: *default-timezone-env
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-avian-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      # Docker Desktop bind mounts can exhaust file handles under MinIO's
+      # background scanner/healer even with a high container nofile limit.
+      # Keep those maintenance loops conservative for this local single-node
+      # object store; foreground S3 reads/writes remain unaffected.
+      MINIO_SCANNER_SPEED: ${MINIO_SCANNER_SPEED:-slowest}
+      MINIO_HEAL_MAX_IO: ${MINIO_HEAL_MAX_IO:-1}
+      MINIO_HEAL_MAX_SLEEP: ${MINIO_HEAL_MAX_SLEEP:-1s}
+    ports:
+      - "${AVIAN_BIND_HOST:?AVIAN_BIND_HOST is required}:${MINIO_API_PORT:?MINIO_API_PORT is required}:9000"
+      - "${AVIAN_BIND_HOST:?AVIAN_BIND_HOST is required}:${MINIO_CONSOLE_PORT:?MINIO_CONSOLE_PORT is required}:9001"
+    volumes:
+      - "${MINIO_DATA_MOUNT:-../../data/minio:/data}"
+    networks:
+      - avian-net
+    healthcheck:
+      # The HTTP endpoint proves MinIO is serving, the /data probe proves
+      # the single backing path is writable, and `mc ready local` catches
+      # MinIO quorum/offline-drive state. `timeout` keeps Docker health
+      # checks bounded if the storage path stalls.
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 6 sh -c 'curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null && probe="/data/.minio-healthcheck" && : > "$$probe" && rm -f "$$probe" && mc ready local >/dev/null 2>&1'
+      interval: 30s
+      timeout: 8s
+      start_period: 60s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # minio-init — bucket creation + scoped application user
+  # ---------------------------------------------------------------------------
+  # One-shot provisioning sidecar. Creates the three buckets used by the
+  # platform, removes any anonymous access, and provisions a
+  # least-privilege user (MINIO_APP_USER) bound to an `audio-rw` policy
+  # that grants read/write only to those buckets. Downstream services
+  # authenticate as the scoped user; the root credentials are used only
+  # here.
+  #
+  # MC_HOST_myminio injects credentials into the mc client without
+  # exposing them in the process list.
+  # ---------------------------------------------------------------------------
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: ab-minio-init
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.25"
+    mem_limit: "128m"
+    mem_reservation: "64m"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc mb --ignore-existing myminio/raw-audio
+        mc mb --ignore-existing myminio/processed-audio
+        mc mb --ignore-existing myminio/features
+        mc anonymous set none myminio/raw-audio
+        mc anonymous set none myminio/processed-audio
+        mc anonymous set none myminio/features
+        cat > /tmp/app-policy.json <<'POLICY'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"],
+              "Resource": [
+                "arn:aws:s3:::raw-audio",
+                "arn:aws:s3:::raw-audio/*",
+                "arn:aws:s3:::processed-audio",
+                "arn:aws:s3:::processed-audio/*",
+                "arn:aws:s3:::features",
+                "arn:aws:s3:::features/*"
+              ]
+            }
+          ]
+        }
+        POLICY
+        mc admin policy create myminio audio-rw /tmp/app-policy.json 2>/dev/null || mc admin policy update myminio audio-rw /tmp/app-policy.json
+        mc admin user info myminio "$$MINIO_APP_USER" >/dev/null 2>&1 || mc admin user add myminio "$$MINIO_APP_USER" "$$MINIO_APP_PASSWORD"
+        mc admin policy attach myminio audio-rw --user="$$MINIO_APP_USER" 2>/dev/null || true
+        echo 'MinIO buckets and scoped app user provisioned.'
+    environment:
+      <<: *default-timezone-env
+      MC_HOST_myminio: "http://${MINIO_ROOT_USER:?MINIO_ROOT_USER is required}:${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}@${MINIO_INTERNAL_HOST:?MINIO_INTERNAL_HOST is required}:${MINIO_INTERNAL_API_PORT:?MINIO_INTERNAL_API_PORT is required}"
+      MINIO_APP_USER: ${MINIO_APP_USER:?MINIO_APP_USER is required}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD:?MINIO_APP_PASSWORD is required}
+    networks:
+      - avian-net
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # dagster-webserver — Dagster UI and GraphQL API
+  # ---------------------------------------------------------------------------
+  # Loads its user-code locations from the `ab-ingestion` and `ab-model`
+  # gRPC code-servers; this image deliberately bundles no project code.
+  # The `workspace.yaml` declaring those code locations is generated from
+  # `config/runtime.env` at container start, so host/port settings are
+  # not duplicated across YAML files.
+  #
+  # All run, event-log, schedule, and daemon-heartbeat state is persisted
+  # in the dedicated `dagster_db` PostgreSQL database, isolated from the
+  # `avian_biosurveillance` application schema.
+  # ---------------------------------------------------------------------------
+  dagster-webserver:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.dagster
+    pull_policy: never
+    image: avian-biosurveillance/dagster:1.9
+    container_name: ab-dagster-webserver
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.5"
+    mem_limit: "384m"
+    mem_reservation: "128m"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        workspace_path="$${DAGSTER_WORKSPACE_PATH:?DAGSTER_WORKSPACE_PATH is required}"
+        mkdir -p "$(dirname "$$workspace_path")"
+        cat > /opt/dagster_home/dagster.yaml <<'EOF'
+        storage:
+          postgres:
+            postgres_db:
+              hostname:
+                env: DAGSTER_PG_HOST
+              username:
+                env: DAGSTER_PG_USER
+              password:
+                env: DAGSTER_PG_PASSWORD
+              db_name:
+                env: DAGSTER_PG_DB
+              port:
+                env: DAGSTER_PG_PORT
+        run_coordinator:
+          module: dagster.core.run_coordinator
+          class: QueuedRunCoordinator
+          config:
+            max_concurrent_runs: 4
+            tag_concurrency_limits:
+              - key: avian/deployment
+                value:
+                  applyLimitPerUniqueValue: true
+                limit: 1
+        run_launcher:
+          module: dagster.core.launcher
+          class: DefaultRunLauncher
+        scheduler:
+          module: dagster.core.scheduler
+          class: DagsterDaemonScheduler
+        run_monitoring:
+          enabled: true
+          start_timeout_seconds: 180
+          cancel_timeout_seconds: 180
+          poll_interval_seconds: 120
+        telemetry:
+          enabled: false
+        auto_materialize:
+          enabled: true
+          use_sensors: false
+        nux:
+          enabled: false
+        EOF
+        cat > "$$workspace_path" <<EOF
+        # Generated from config/runtime.env at container startup.
+        load_from:
+          - grpc_server:
+              host: ${DAGSTER_CODE_SERVER_DOCKER_HOST:?DAGSTER_CODE_SERVER_DOCKER_HOST is required}
+              port: ${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}
+              location_name: ${DAGSTER_LOCATION_NAME:?DAGSTER_LOCATION_NAME is required}
+          - grpc_server:
+              host: ${DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST:?DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST is required}
+              port: ${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}
+              location_name: ${DAGSTER_MODEL_LOCATION_NAME:?DAGSTER_MODEL_LOCATION_NAME is required}
+        EOF
+        if [ -x /usr/local/bin/dagster_migrate_instance.py ]; then
+          python /usr/local/bin/dagster_migrate_instance.py
+        else
+          echo "dagster_migrate_instance.py not present in image; skipping startup migration helper."
+        fi
+        python /usr/local/bin/dagster_wait_for_code_servers.py
+        exec dagster-webserver --host ${DAGSTER_WEBSERVER_HOST:?DAGSTER_WEBSERVER_HOST is required} --port ${DAGSTER_INTERNAL_PORT:?DAGSTER_INTERNAL_PORT is required} --workspace "$$workspace_path"
+    environment:
+      <<: *default-timezone-env
+      DAGSTER_HOME: /opt/dagster_home
+      DAGSTER_WORKSPACE_PATH: /tmp/dagster-workspace.yaml
+      DAGSTER_GRPC_TIMEOUT_SECONDS: ${DAGSTER_GRPC_TIMEOUT_SECONDS:-300}
+      DAGSTER_INTERNAL_PORT: "${DAGSTER_INTERNAL_PORT:?DAGSTER_INTERNAL_PORT is required}"
+      DAGSTER_CODE_SERVER_DOCKER_HOST: ${DAGSTER_CODE_SERVER_DOCKER_HOST:?DAGSTER_CODE_SERVER_DOCKER_HOST is required}
+      DAGSTER_CODE_SERVER_PORT: "${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}"
+      DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST: ${DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST:?DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST is required}
+      DAGSTER_MODEL_CODE_SERVER_PORT: "${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}"
+      DAGSTER_PG_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      DAGSTER_PG_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-root}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DAGSTER_PG_DB: dagster_db
+    volumes:
+      - ../../data/dagster_home:/opt/dagster_home
+    ports:
+      - "${AVIAN_BIND_HOST:?AVIAN_BIND_HOST is required}:${DAGSTER_PORT:?DAGSTER_PORT is required}:${DAGSTER_INTERNAL_PORT:?DAGSTER_INTERNAL_PORT is required}"
+    depends_on:
+      dagster-home-init:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      timescaledb-init:
+        condition: service_completed_successfully
+      ingestion:
+        condition: service_healthy
+        # `restart: true` recreates the webserver after explicit Compose
+        # updates to the ingestion code-server so Dagster does not keep
+        # polling a stale or temporarily-absent gRPC endpoint.
+        restart: true
+      model:
+        condition: service_healthy
+        restart: true
+    networks:
+      - avian-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ['DAGSTER_INTERNAL_PORT'] + '/server_info')\""]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # dagster-daemon — schedules, sensors, and run coordination
+  # ---------------------------------------------------------------------------
+  # Required for cron schedules and sensors to fire. Shares the same
+  # `dagster.yaml` instance file and dynamically-generated
+  # `workspace.yaml` as the webserver, so both processes observe the same
+  # storage backend and code-location definition.
+  # ---------------------------------------------------------------------------
+  dagster-daemon:
+    # Reuses the single Dagster image built for dagster-webserver above.
+    pull_policy: never
+    image: avian-biosurveillance/dagster:1.9
+    container_name: ab-dagster-daemon
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.5"
+    mem_limit: "384m"
+    mem_reservation: "128m"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        workspace_path="$${DAGSTER_WORKSPACE_PATH:?DAGSTER_WORKSPACE_PATH is required}"
+        mkdir -p "$(dirname "$$workspace_path")"
+        cat > /opt/dagster_home/dagster.yaml <<'EOF'
+        storage:
+          postgres:
+            postgres_db:
+              hostname:
+                env: DAGSTER_PG_HOST
+              username:
+                env: DAGSTER_PG_USER
+              password:
+                env: DAGSTER_PG_PASSWORD
+              db_name:
+                env: DAGSTER_PG_DB
+              port:
+                env: DAGSTER_PG_PORT
+        run_coordinator:
+          module: dagster.core.run_coordinator
+          class: QueuedRunCoordinator
+          config:
+            max_concurrent_runs: 4
+            tag_concurrency_limits:
+              - key: avian/deployment
+                value:
+                  applyLimitPerUniqueValue: true
+                limit: 1
+        run_launcher:
+          module: dagster.core.launcher
+          class: DefaultRunLauncher
+        scheduler:
+          module: dagster.core.scheduler
+          class: DagsterDaemonScheduler
+        run_monitoring:
+          enabled: true
+          start_timeout_seconds: 180
+          cancel_timeout_seconds: 180
+          poll_interval_seconds: 120
+        telemetry:
+          enabled: false
+        auto_materialize:
+          enabled: true
+          use_sensors: false
+        nux:
+          enabled: false
+        EOF
+        cat > "$$workspace_path" <<EOF
+        # Generated from config/runtime.env at container startup.
+        load_from:
+          - grpc_server:
+              host: ${DAGSTER_CODE_SERVER_DOCKER_HOST:?DAGSTER_CODE_SERVER_DOCKER_HOST is required}
+              port: ${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}
+              location_name: ${DAGSTER_LOCATION_NAME:?DAGSTER_LOCATION_NAME is required}
+          - grpc_server:
+              host: ${DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST:?DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST is required}
+              port: ${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}
+              location_name: ${DAGSTER_MODEL_LOCATION_NAME:?DAGSTER_MODEL_LOCATION_NAME is required}
+        EOF
+        if [ -x /usr/local/bin/dagster_migrate_instance.py ]; then
+          python /usr/local/bin/dagster_migrate_instance.py
+        else
+          echo "dagster_migrate_instance.py not present in image; skipping startup migration helper."
+        fi
+        python /usr/local/bin/dagster_wait_for_code_servers.py
+        python /usr/local/bin/dagster_reconcile_run_state.py
+        python /usr/local/bin/dagster_reconcile_sensor_state.py
+        exec dagster-daemon run --log-level warning --workspace "$$workspace_path"
+    environment:
+      <<: *default-timezone-env
+      DAGSTER_HOME: /opt/dagster_home
+      DAGSTER_WORKSPACE_PATH: /tmp/dagster-workspace.yaml
+      DAGSTER_GRPC_TIMEOUT_SECONDS: ${DAGSTER_GRPC_TIMEOUT_SECONDS:-300}
+      DAGSTER_CODE_SERVER_DOCKER_HOST: ${DAGSTER_CODE_SERVER_DOCKER_HOST:?DAGSTER_CODE_SERVER_DOCKER_HOST is required}
+      DAGSTER_CODE_SERVER_PORT: "${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}"
+      DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST: ${DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST:?DAGSTER_MODEL_CODE_SERVER_DOCKER_HOST is required}
+      DAGSTER_MODEL_CODE_SERVER_PORT: "${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}"
+      DAGSTER_PG_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      DAGSTER_PG_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-root}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DAGSTER_PG_DB: dagster_db
+    volumes:
+      - ../../data/dagster_home:/opt/dagster_home
+    depends_on:
+      dagster-home-init:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      timescaledb-init:
+        condition: service_completed_successfully
+      ingestion:
+        condition: service_healthy
+        # Keep sensor and schedule evaluation coupled to the code-server
+        # lifecycle during explicit Compose updates; otherwise Dagster
+        # logs transient DagsterUserCodeUnreachableError while ingestion
+        # is being recreated.
+        restart: true
+      model:
+        condition: service_healthy
+        restart: true
+      dagster-webserver:
+        condition: service_healthy
+        restart: true
+    networks:
+      - avian-net
+
+  # ---------------------------------------------------------------------------
+  # ingestion — Dagster gRPC code-server (ETL flows)
+  # ---------------------------------------------------------------------------
+  # Owns BirdWeather, KNMI, Sovon, eBird, Movebank, CDS drought, and
+  # Google Earth Engine ingestion. Exposes the project's Dagster `defs`
+  # symbol over gRPC for the webserver and daemon to consume.
+  #
+  # This is the hungriest service on the stack — if ETL stalls or memory
+  # is tight, raise its CPU and memory limits first.
+  # ---------------------------------------------------------------------------
+  ingestion:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.ingestion
+      args:
+        # 0 = CPU-only TensorFlow (default). Set to 1 (with the NVIDIA
+        # Container Toolkit installed) to build the CUDA embeddings runtime.
+        EMBEDDINGS_GPU: ${EMBEDDINGS_GPU:-0}
+    pull_policy: never
+    image: avian-biosurveillance/ingestion:0.1.0
+    container_name: ab-ingestion
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "2.0"
+    mem_limit: "3g"
+    mem_reservation: "1g"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /opt/dagster_home/dagster.yaml <<'EOF'
+        storage:
+          postgres:
+            postgres_db:
+              hostname:
+                env: DAGSTER_PG_HOST
+              username:
+                env: DAGSTER_PG_USER
+              password:
+                env: DAGSTER_PG_PASSWORD
+              db_name:
+                env: DAGSTER_PG_DB
+              port:
+                env: DAGSTER_PG_PORT
+        run_coordinator:
+          module: dagster.core.run_coordinator
+          class: QueuedRunCoordinator
+          config:
+            max_concurrent_runs: 4
+            tag_concurrency_limits:
+              - key: avian/deployment
+                value:
+                  applyLimitPerUniqueValue: true
+                limit: 1
+        run_launcher:
+          module: dagster.core.launcher
+          class: DefaultRunLauncher
+        scheduler:
+          module: dagster.core.scheduler
+          class: DagsterDaemonScheduler
+        run_monitoring:
+          enabled: true
+          start_timeout_seconds: 180
+          cancel_timeout_seconds: 180
+          poll_interval_seconds: 120
+        telemetry:
+          enabled: false
+        auto_materialize:
+          enabled: true
+          use_sensors: false
+        nux:
+          enabled: false
+        EOF
+        python - <<'PY'
+        from pathlib import Path
+        import site
+
+        user_site = Path(site.USER_SITE)
+        user_site.mkdir(parents=True, exist_ok=True)
+        (user_site / 'avian_biosurveillance-src.pth').write_text(
+            '/app/src\n',
+            encoding='utf-8',
+        )
+        PY
+        python /usr/local/bin/dagster_reconcile_run_state.py
+        case "${BIRDWEATHER_LOCAL_BACKLOG_AUTOSTART:-false}" in
+          1|true|TRUE|yes|YES)
+            (
+              retry_delay="${BIRDWEATHER_LOCAL_BACKLOG_RETRY_DELAY_SECONDS:-30}"
+              extra_args=""
+              case "${BIRDWEATHER_LOCAL_BACKLOG_ENSURE_DETECTIONS:-false}" in
+                1|true|TRUE|yes|YES)
+                  extra_args="--ensure-detections"
+                  ;;
+              esac
+              while true; do
+                echo "Starting BirdWeather local backlog autostart."
+                if python -m avian_biosurveillance.ops.run_birdweather_local_backlog \
+                  --start-date "${BIRDWEATHER_LOCAL_BACKLOG_START_DATE:-2025-01-01}" \
+                  --end-date "${BIRDWEATHER_LOCAL_BACKLOG_END_DATE:-2025-12-31}" \
+                  --state-path "${BIRDWEATHER_LOCAL_BACKLOG_STATE_PATH:-data/raw/birdweather_local_backlog_state.json}" \
+                  --raw-root "${BIRDWEATHER_LOCAL_BACKLOG_RAW_ROOT:-data/raw/birdweather}" \
+                  --workers "${BIRDWEATHER_LOCAL_BACKLOG_WORKERS:-20}" \
+                  --raw-workers "${BIRDWEATHER_LOCAL_BACKLOG_RAW_WORKERS:-8}" \
+                  --storage-retry-attempts "${BIRDWEATHER_LOCAL_BACKLOG_STORAGE_RETRY_ATTEMPTS:-2}" \
+                  $$extra_args; then
+                  echo "BirdWeather local backlog completed successfully; waiting for the next container restart."
+                  break
+                fi
+                exit_code=$$?
+                echo "BirdWeather local backlog exited with status $$exit_code; retrying in $$retry_delay s."
+                sleep "$$retry_delay"
+              done
+            ) &
+            ;;
+        esac
+        exec python -m avian_biosurveillance.orchestration.serve
+    environment:
+      <<: [*default-timezone-env, *thread-caps]
+      PYTHONPATH: "/app/src"
+      AVIAN_DAGSTER_CODE_LOCATION: ingestion
+      # Dagster gRPC code-server settings (consumed by serve.py).
+      DAGSTER_CODE_SERVER_HOST: ${DAGSTER_CODE_SERVER_HOST:?DAGSTER_CODE_SERVER_HOST is required}
+      DAGSTER_CODE_SERVER_PORT: "${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}"
+      DAGSTER_HOME: /opt/dagster_home
+      DAGSTER_GRPC_TIMEOUT_SECONDS: ${DAGSTER_GRPC_TIMEOUT_SECONDS:-300}
+      # Postgres backend for Dagster instance state (matches dagster.yaml).
+      DAGSTER_PG_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      DAGSTER_PG_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-root}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DAGSTER_PG_DB: dagster_db
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-root}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}:${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}/${POSTGRES_DB:-avian_biosurveillance}"
+      STATION_SUMMARY_DB_USER: ${POSTGRES_USER:-root}
+      STATION_SUMMARY_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      STATION_SUMMARY_DB_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      STATION_SUMMARY_DB_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      STATION_SUMMARY_DB_NAME: ${POSTGRES_DB:-avian_biosurveillance}
+      MINIO_ENDPOINT: "${MINIO_INTERNAL_HOST:?MINIO_INTERNAL_HOST is required}:${MINIO_INTERNAL_API_PORT:?MINIO_INTERNAL_API_PORT is required}"
+      MINIO_ACCESS_KEY: ${MINIO_APP_USER:?MINIO_APP_USER is required}
+      MINIO_SECRET_KEY: ${MINIO_APP_PASSWORD:?MINIO_APP_PASSWORD is required}
+      # Bounded MinIO timeouts so a transient stall fails fast instead of
+      # hanging on the SDK's 300 s default read timeout during backfills.
+      MINIO_CONNECT_TIMEOUT_SECONDS: ${MINIO_CONNECT_TIMEOUT_SECONDS:-10}
+      MINIO_READ_TIMEOUT_SECONDS: ${MINIO_READ_TIMEOUT_SECONDS:-120}
+      # Numba JIT cache dir for librosa. The default in-tree cache under
+      # site-packages is read-only in this image, which makes embedding
+      # compilation raise "cannot cache function ... no locator available";
+      # point it at a writable, persistent dir so embeddings do not fail.
+      NUMBA_CACHE_DIR: ${NUMBA_CACHE_DIR:-/opt/dagster_home/storage/numba_cache}
+      # Embedding runtime tuning. AVIAN_PERCH_V2_VARIANT defaults to `auto`,
+      # which loads the GPU Perch v2 SavedModel when TensorFlow can see a CUDA
+      # device (CUDA build + NVIDIA Container Toolkit) and the CPU SavedModel
+      # otherwise. compose.sh auto-attaches the GPU layer when the host
+      # supports it, so the same config works with or without a GPU. The
+      # feature backfill prefetches clip downloads/decodes concurrently and
+      # micro-batches embeddings.
+      AVIAN_PERCH_V2_VARIANT: ${AVIAN_PERCH_V2_VARIANT:-cpu}
+      AVIAN_TF_GPU_MEMORY_GROWTH: ${AVIAN_TF_GPU_MEMORY_GROWTH:-1}
+      BIRDWEATHER_AUDIO_MAX_WORKERS: ${BIRDWEATHER_AUDIO_MAX_WORKERS:-4}
+      BIRDWEATHER_FEATURE_PREFETCH_WORKERS: ${BIRDWEATHER_FEATURE_PREFETCH_WORKERS:-4}
+      BIRDWEATHER_LOCAL_BACKLOG_AUTOSTART: ${BIRDWEATHER_LOCAL_BACKLOG_AUTOSTART:-false}
+      BIRDWEATHER_LOCAL_BACKLOG_START_DATE: ${BIRDWEATHER_LOCAL_BACKLOG_START_DATE:-2025-01-01}
+      BIRDWEATHER_LOCAL_BACKLOG_END_DATE: ${BIRDWEATHER_LOCAL_BACKLOG_END_DATE:-2025-12-31}
+      BIRDWEATHER_LOCAL_BACKLOG_STATE_PATH: ${BIRDWEATHER_LOCAL_BACKLOG_STATE_PATH:-data/raw/birdweather_local_backlog_state.json}
+      BIRDWEATHER_LOCAL_BACKLOG_RAW_ROOT: ${BIRDWEATHER_LOCAL_BACKLOG_RAW_ROOT:-data/raw/birdweather}
+      BIRDWEATHER_LOCAL_BACKLOG_ENSURE_DETECTIONS: ${BIRDWEATHER_LOCAL_BACKLOG_ENSURE_DETECTIONS:-false}
+      BIRDWEATHER_LOCAL_BACKLOG_WORKERS: ${BIRDWEATHER_LOCAL_BACKLOG_WORKERS:-8}
+      BIRDWEATHER_LOCAL_BACKLOG_RAW_WORKERS: ${BIRDWEATHER_LOCAL_BACKLOG_RAW_WORKERS:-4}
+      BIRDWEATHER_LOCAL_BACKLOG_STORAGE_RETRY_ATTEMPTS: ${BIRDWEATHER_LOCAL_BACKLOG_STORAGE_RETRY_ATTEMPTS:-2}
+      BIRDWEATHER_LOCAL_BACKLOG_RETRY_DELAY_SECONDS: ${BIRDWEATHER_LOCAL_BACKLOG_RETRY_DELAY_SECONDS:-30}
+      BIRDWEATHER_RAW_AUDIO_MAX_WORKERS: ${BIRDWEATHER_RAW_AUDIO_MAX_WORKERS:-2}
+      BIRDWEATHER_PAGE_SLEEP_SECONDS: ${BIRDWEATHER_PAGE_SLEEP_SECONDS:-0.02}
+      KNMI_OPEN_DATA_API: ${KNMI_OPEN_DATA_API:-}
+      KNMI_EDR: ${KNMI_EDR:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      XDG_CACHE_HOME: /opt/dagster_home/.cache
+      HF_HOME: /opt/dagster_home/.cache/huggingface
+      HF_HUB_CACHE: /opt/dagster_home/.cache/huggingface/hub
+      TRANSFORMERS_CACHE: /opt/dagster_home/.cache/huggingface/transformers
+      MPLCONFIGDIR: /tmp/matplotlib
+      EBIRD_API_KEY: ${EBIRD_API_KEY:-}
+      MOVEBANK_USERNAME: ${MOVEBANK_USERNAME:-}
+      MOVEBANK_PASSWORD: ${MOVEBANK_PASSWORD:-}
+      # Prefer file-based GEE credentials: mount a JSON key at
+      # /app/secrets/gee-sa.json and set GEE_SERVICE_ACCOUNT_FILE
+      # accordingly. Inline JSON in GEE_SERVICE_ACCOUNT_CREDENTIALS is
+      # visible via `docker inspect` and /proc/<pid>/environ — avoid in
+      # production.
+      GEE_SERVICE_ACCOUNT_FILE: ${GEE_SERVICE_ACCOUNT_FILE:-}
+      GEE_SERVICE_ACCOUNT_CREDENTIALS: ${GEE_SERVICE_ACCOUNT_CREDENTIALS:-}
+      GEE_PROJECT: ${GEE_PROJECT:-}
+      EARTH_ENGINE_HIGH_VOLUME: ${EARTH_ENGINE_HIGH_VOLUME:-true}
+      EARTH_ENGINE_SECTION_WORKERS: ${EARTH_ENGINE_SECTION_WORKERS:-2}
+      EARTH_ENGINE_GRID_CELL_WORKERS: ${EARTH_ENGINE_GRID_CELL_WORKERS:-2}
+      EARTH_ENGINE_GRID_DB_BATCH_SIZE: ${EARTH_ENGINE_GRID_DB_BATCH_SIZE:-200}
+      EARTH_ENGINE_HTTP_POOL_SIZE: ${EARTH_ENGINE_HTTP_POOL_SIZE:-10}
+      CDS_API_KEY: ${CDS_API_KEY:-}
+      CDS_API_URL: ${CDS_API_URL:?CDS_API_URL is required}
+      # Historical catchup startup controls. Prefer the CATCHUP_* names;
+      # the BACKFILL_* aliases remain wired for compatibility with older
+      # env files.
+      CATCHUP_AUTOSTART: ${CATCHUP_AUTOSTART:-}
+      CATCHUP_START_DATE: ${CATCHUP_START_DATE:-}
+      CATCHUP_END_DATE: ${CATCHUP_END_DATE:-}
+      CATCHUP_TARGET: ${CATCHUP_TARGET:-}
+      CATCHUP_SOURCES: ${CATCHUP_SOURCES:-}
+      BACKFILL_AUTOSTART: ${BACKFILL_AUTOSTART:-}
+      BACKFILL_START_DATE: ${BACKFILL_START_DATE:-}
+      BACKFILL_END_DATE: ${BACKFILL_END_DATE:-}
+      BACKFILL_TARGET: ${BACKFILL_TARGET:-}
+      BACKFILL_SOURCES: ${BACKFILL_SOURCES:-}
+      AVIAN_WEIGHTS_DIR: /app/weights
+    volumes:
+      - ../../src:/app/src:ro
+      - ../../config:/app/config:ro
+      - ../../data/reference:/app/data/reference:ro
+      # Named volume keeps ETL raw/cache artifacts (Sovon historical
+      # chart and JSON caches) warm across container rebuilds, without
+      # relying on host-path write permissions for the non-root app user.
+      - ingestion-raw-data:/app/data/raw
+      - ../../weights:/app/weights
+      # Dagster instance state. SQLite-backed local artifacts only — the
+      # primary store remains Postgres.
+      - ../../data/dagster_home:/opt/dagster_home
+      # GEE service-account JSON. GEE_SERVICE_ACCOUNT_FILE_HOST sets the
+      # host path; /dev/null is the safe default when GEE is not
+      # configured.
+      - ${GEE_SERVICE_ACCOUNT_FILE_HOST:-/dev/null}:/app/secrets/gee-sa.json:ro
+    expose:
+      - "${DAGSTER_CODE_SERVER_PORT:?DAGSTER_CODE_SERVER_PORT is required}"
+    depends_on:
+      dagster-home-init:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      timescaledb-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - avian-net
+
+  # ---------------------------------------------------------------------------
+  # model — Dagster gRPC code-server (feature engineering + modeling)
+  # ---------------------------------------------------------------------------
+  # Owns BirdWeather feature engineering today and is the home for future
+  # unsupervised models, evaluation jobs, experiment tracking, and model
+  # registries. Lives in its own gRPC code-server so the ML stack can be
+  # rebuilt independently of ingestion.
+  # ---------------------------------------------------------------------------
+  model:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.model
+    pull_policy: never
+    image: avian-biosurveillance/model:0.1.0
+    container_name: ab-model
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "1.0"
+    mem_limit: "2g"
+    mem_reservation: "512m"
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /opt/dagster_home/dagster.yaml <<'EOF'
+        storage:
+          postgres:
+            postgres_db:
+              hostname:
+                env: DAGSTER_PG_HOST
+              username:
+                env: DAGSTER_PG_USER
+              password:
+                env: DAGSTER_PG_PASSWORD
+              db_name:
+                env: DAGSTER_PG_DB
+              port:
+                env: DAGSTER_PG_PORT
+        run_coordinator:
+          module: dagster.core.run_coordinator
+          class: QueuedRunCoordinator
+          config:
+            max_concurrent_runs: 4
+            tag_concurrency_limits:
+              - key: avian/deployment
+                value:
+                  applyLimitPerUniqueValue: true
+                limit: 1
+        run_launcher:
+          module: dagster.core.launcher
+          class: DefaultRunLauncher
+        scheduler:
+          module: dagster.core.scheduler
+          class: DagsterDaemonScheduler
+        run_monitoring:
+          enabled: true
+          start_timeout_seconds: 180
+          cancel_timeout_seconds: 180
+          poll_interval_seconds: 120
+        telemetry:
+          enabled: false
+        auto_materialize:
+          enabled: true
+          use_sensors: false
+        nux:
+          enabled: false
+        EOF
+        python - <<'PY'
+        from pathlib import Path
+        import site
+
+        user_site = Path(site.USER_SITE)
+        user_site.mkdir(parents=True, exist_ok=True)
+        (user_site / 'avian_biosurveillance-src.pth').write_text(
+            '/app/src\n',
+            encoding='utf-8',
+        )
+        PY
+        exec python -m avian_biosurveillance.orchestration.serve
+    environment:
+      <<: [*default-timezone-env, *thread-caps]
+      PYTHONPATH: "/app/src"
+      AVIAN_DAGSTER_CODE_LOCATION: model
+      DAGSTER_CODE_SERVER_HOST: ${DAGSTER_CODE_SERVER_HOST:?DAGSTER_CODE_SERVER_HOST is required}
+      DAGSTER_CODE_SERVER_PORT: "${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}"
+      DAGSTER_HOME: /opt/dagster_home
+      DAGSTER_GRPC_TIMEOUT_SECONDS: ${DAGSTER_GRPC_TIMEOUT_SECONDS:-300}
+      DAGSTER_PG_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      DAGSTER_PG_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-root}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      DAGSTER_PG_DB: dagster_db
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-root}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}:${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}/${POSTGRES_DB:-avian_biosurveillance}"
+      STATION_SUMMARY_DB_USER: ${POSTGRES_USER:-root}
+      STATION_SUMMARY_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      STATION_SUMMARY_DB_HOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      STATION_SUMMARY_DB_PORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      STATION_SUMMARY_DB_NAME: ${POSTGRES_DB:-avian_biosurveillance}
+      HF_TOKEN: ${HF_TOKEN:-}
+      XDG_CACHE_HOME: /opt/dagster_home/.cache
+      HF_HOME: /opt/dagster_home/.cache/huggingface
+      HF_HUB_CACHE: /opt/dagster_home/.cache/huggingface/hub
+      TRANSFORMERS_CACHE: /opt/dagster_home/.cache/huggingface/transformers
+      MPLCONFIGDIR: /tmp/matplotlib
+      MINIO_ENDPOINT: "${MINIO_INTERNAL_HOST:?MINIO_INTERNAL_HOST is required}:${MINIO_INTERNAL_API_PORT:?MINIO_INTERNAL_API_PORT is required}"
+      MINIO_ACCESS_KEY: ${MINIO_APP_USER:?MINIO_APP_USER is required}
+      MINIO_SECRET_KEY: ${MINIO_APP_PASSWORD:?MINIO_APP_PASSWORD is required}
+      AVIAN_WEIGHTS_DIR: /app/weights
+      TORCH_HOME: /app/weights/torch
+      NUMBA_CACHE_DIR: ${NUMBA_CACHE_DIR:-/opt/dagster_home/storage/numba_cache}
+    volumes:
+      - ../../src:/app/src:ro
+      - ../../config:/app/config:ro
+      - ../../data/reference:/app/data/reference:ro
+      - ../../weights:/app/weights
+      - ../../data/dagster_home:/opt/dagster_home
+    expose:
+      - "${DAGSTER_MODEL_CODE_SERVER_PORT:?DAGSTER_MODEL_CODE_SERVER_PORT is required}"
+    depends_on:
+      dagster-home-init:
+        condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
+      timescaledb-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - avian-net
+
+  # ---------------------------------------------------------------------------
+  # frontend — Next.js 15 dashboard
+  # ---------------------------------------------------------------------------
+  # The user-facing dashboard, served from the standalone Next.js output.
+  # Reads detection, station, and modeling data directly from
+  # TimescaleDB, queries Dagster status over GraphQL, and resolves audio
+  # and feature artifacts via MinIO. Connects with the shared root role
+  # used by the local stack.
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: ../infrastructure/docker/Dockerfile.frontend
+      args:
+        # NEXT_PUBLIC_* variables are inlined into the JS bundle at build
+        # time. Runtime env vars are ignored for NEXT_PUBLIC_ in
+        # standalone output, so they must be passed as build ARGs and
+        # must contain browser-reachable URLs — not internal Docker
+        # hostnames.
+        NEXT_PUBLIC_DAGSTER_GRAPHQL_URL: ${NEXT_PUBLIC_DAGSTER_GRAPHQL_URL:?NEXT_PUBLIC_DAGSTER_GRAPHQL_URL is required}
+    pull_policy: never
+    image: avian-biosurveillance/frontend:0.1.0
+    container_name: ab-frontend
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt: *default-security
+    cpus: "0.25"
+    mem_limit: "512m"
+    mem_reservation: "128m"
+    environment:
+      <<: *default-timezone-env
+      # Bound the V8 old-space below the 512m mem_limit. Node otherwise sizes
+      # its heap from host memory and can be OOM-killed by the cgroup.
+      NODE_OPTIONS: ${AVIAN_NODE_OPTIONS:---max-old-space-size=384}
+      PORT: "${APP_INTERNAL_PORT:?APP_INTERNAL_PORT is required}"
+      HOSTNAME: ${APP_INTERNAL_HOST:?APP_INTERNAL_HOST is required}
+      APP_READY_FILE: /app/.runtime/species-tracker-ready
+      INTERNAL_URL: ${INTERNAL_URL:?INTERNAL_URL is required}
+      DAGSTER_LOCATION_NAME: ${DAGSTER_LOCATION_NAME:?DAGSTER_LOCATION_NAME is required}
+      DAGSTER_MODEL_LOCATION_NAME: ${DAGSTER_MODEL_LOCATION_NAME:?DAGSTER_MODEL_LOCATION_NAME is required}
+      NEXT_PUBLIC_DAGSTER_UI_URL: ${NEXT_PUBLIC_DAGSTER_UI_URL:?NEXT_PUBLIC_DAGSTER_UI_URL is required}
+      # Discrete libpq variables instead of a DATABASE_URL so reserved
+      # password characters cannot corrupt the Node pg URL parser inside
+      # the frontend container.
+      PGUSER: ${POSTGRES_USER:-root}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PGHOST: ${POSTGRES_INTERNAL_HOST:?POSTGRES_INTERNAL_HOST is required}
+      PGPORT: "${POSTGRES_INTERNAL_PORT:?POSTGRES_INTERNAL_PORT is required}"
+      PGDATABASE: ${POSTGRES_DB:-avian_biosurveillance}
+      # Server-side rendering uses the internal Docker hostname here; the
+      # NEXT_PUBLIC_DAGSTER_GRAPHQL_URL variable baked into the JS bundle
+      # at build time is the one used for browser-side requests.
+      DAGSTER_GRAPHQL_URL: ${DAGSTER_GRAPHQL_URL:?DAGSTER_GRAPHQL_URL is required}
+      MINIO_ENDPOINT: "${MINIO_INTERNAL_HOST:?MINIO_INTERNAL_HOST is required}:${MINIO_INTERNAL_API_PORT:?MINIO_INTERNAL_API_PORT is required}"
+      MINIO_ACCESS_KEY: ${MINIO_APP_USER:?MINIO_APP_USER is required}
+      MINIO_SECRET_KEY: ${MINIO_APP_PASSWORD:?MINIO_APP_PASSWORD is required}
+    ports:
+      - "${AVIAN_BIND_HOST:?AVIAN_BIND_HOST is required}:${APP_PORT:?APP_PORT is required}:${APP_INTERNAL_PORT:?APP_INTERNAL_PORT is required}"
+    volumes:
+      - ../../data/reference:/app/data/reference:ro
+      - ../../config:/app/config
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      timescaledb-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      dagster-webserver:
+        condition: service_healthy
+    networks:
+      - avian-net
+    # Mirrors the HEALTHCHECK directive in Dockerfile.frontend so
+    # `docker compose ps` reports readiness correctly even when the
+    # image is rebuilt without the directive.
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider \"http://127.0.0.1:$$PORT/api/health\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3

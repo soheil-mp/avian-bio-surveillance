@@ -1,0 +1,108 @@
+
+# === General ===
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.python-version
+
+# === Distribution / Build ===
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# === Virtual Environments ===
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.example
+.env.enc
+
+# === Testing & Quality ===
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# === Documentation ===
+docs/_build/
+docs/sphinx/_build/
+
+# === IDEs / Editors ===
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# === Secrets / Credentials ===
+scripts/encryption/password.txt
+*-service-account-key.json
+*.key.json
+infrastructure/secrets/
+
+# === Project Specific ===
+archive/
+
+# Ignore all data contents, but keep placeholder .gitkeep files.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+weights/*
+!weights/.gitkeep
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# Logs
+logs/
+*.log
+
+# Backup leftovers
+*.bak
+*.bak[0-9]*
+*.bak-*
+*.bak.*
+*.bak_*
+
+# Local project artifacts
+todo.md
+dta_census_audio/
+output/
+.checkpoints/imagebind_huge.pth
+delete/
+docker_logs.txt
+performance_audit.csv
+performance_metrics_export.csv
+.copilot-tmp/
+config/docker.local.env
+# === Tooling cache + code indexer ===
+.cache/
+.karp-inspector/

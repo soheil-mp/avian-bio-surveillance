@@ -1,0 +1,23 @@
+{
+  "_comment": "Configuration for the unsupervised anomaly model tuning sweep. The model is NEVER trained on weak labels; SOVON mortality context is used only as a model-SELECTION criterion. See src/avian_biosurveillance/modeling/tuning.py for the methodology.",
+  "_mode_comment": "axis = one-factor-at-a-time around the live config baseline (cheap, interpretable). product = full Cartesian grid (expensive). Both are capped by max_configs.",
+  "mode": "axis",
+  "max_configs": 24,
+  "top_k": 25,
+  "grid": {
+    "seasonal_window_weeks": [2, 3, 4],
+    "min_seasonal_history": [6, 8, 10],
+    "include_embedding_control": [true, false],
+    "embedding_k_neighbors": [5, 10, 20],
+    "embedding_min_baseline_clips": [30, 50, 80]
+  },
+  "_objective_comment": "Weighted sum of above-random ranking skill against weak labels minus a specificity guardrail penalty. AUROC contributions are mapped via max(0, auroc-0.5)*2 so 0.5 (random) scores 0. Missing metrics contribute 0.",
+  "objective_weights": {
+    "sovon_mortality_auroc": 0.35,
+    "sovon_mortality_ap": 0.15,
+    "mean_weak_label_auroc": 0.3,
+    "best_lead_lag_abs_spearman": 0.2
+  },
+  "_penalty_comment": "Subtracts penalty * mean(|non_target_species_AUROC - 0.5| * 2). High alignment on non-target species suggests confounding rather than species-specific signal.",
+  "negative_control_penalty": 0.5
+}

@@ -1,0 +1,41 @@
+# =============================================================================
+# docker-compose.gpu.yml — GPU layer for the ingestion worker
+# =============================================================================
+# Enables NVIDIA GPU acceleration for the Perch v2 embedding model.
+#
+# You normally do NOT pass this file by hand: `infrastructure/docker/compose.sh`
+# auto-detects a usable GPU on the host (an NVIDIA device plus a Docker `nvidia`
+# runtime) and layers this override in automatically. When no usable GPU is
+# present it is skipped and the stack runs on CPU, so a single command works
+# everywhere:
+#
+#   bash infrastructure/docker/compose.sh up -d --build ingestion
+#
+# Force CPU even on a GPU host:  AVIAN_DISABLE_GPU=1 bash .../compose.sh up -d
+# Apply this layer manually:
+#   docker compose \
+#     -f infrastructure/docker/docker-compose.yml \
+#     -f infrastructure/docker/docker-compose.gpu.yml \
+#     up -d --build ingestion
+#
+# Host prerequisite (one-time, requires sudo) for the GPU path to be detected:
+#   1. Install the NVIDIA Container Toolkit.
+#   2. Run: sudo nvidia-ctk runtime configure --runtime=docker
+#   3. Restart Docker: sudo systemctl restart docker
+#
+# Until that is done, compose.sh simply keeps running on CPU — nothing breaks.
+# =============================================================================
+
+services:
+  ingestion:
+    build:
+      args:
+        # Build the CUDA TensorFlow runtime (tensorflow[and-cuda]).
+        EMBEDDINGS_GPU: "1"
+    # Expose all host GPUs to the container (Compose `gpus` shorthand).
+    gpus: all
+    environment:
+      # `auto` resolves to the GPU Perch v2 SavedModel because TensorFlow can
+      # now see the CUDA device; it falls back to CPU automatically if not.
+      AVIAN_PERCH_V2_VARIANT: ${AVIAN_PERCH_V2_VARIANT:-auto}
+      AVIAN_TF_GPU_MEMORY_GROWTH: "1"

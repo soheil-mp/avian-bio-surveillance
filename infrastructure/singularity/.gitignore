@@ -1,0 +1,9 @@
+# SIF images (large binaries — built via build.sh, not committed)
+sif/
+
+# Runtime volumes (persistent data created by start.sh)
+volumes/
+
+# Local Singularity / Apptainer scratch + cache directories
+.cache/
+.tmp/

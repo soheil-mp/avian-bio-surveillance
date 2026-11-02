@@ -1,0 +1,127 @@
+# =============================================================================
+# Dagster Instance Configuration
+# =============================================================================
+# Backing storage, run coordination, scheduling, and feature toggles for the
+# Dagster instance shared by the webserver and the daemon containers.
+#
+# Storage strategy
+#   All persistent state — runs, event logs, schedules, daemon heartbeats —
+#   lives in the dedicated `dagster_db` PostgreSQL database. This keeps
+#   orchestration metadata isolated from the `avian_biosurveillance`
+#   application schema.
+#
+# Environment interpolation
+#   `env: VAR` references are resolved by Dagster at process start. The
+#   referenced variables are exported by the `ab-dagster-webserver` and
+#   `ab-dagster-daemon` services in `docker-compose.yml`.
+# =============================================================================
+
+storage:
+  postgres:
+    # Connection mapping for the Postgres metadata backend. All fields are
+    # populated from the DAGSTER_PG_* environment variables set by Compose.
+    postgres_db:
+      hostname:
+        env: DAGSTER_PG_HOST
+      username:
+        env: DAGSTER_PG_USER
+      password:
+        env: DAGSTER_PG_PASSWORD
+      db_name:
+        env: DAGSTER_PG_DB
+      port:
+        env: DAGSTER_PG_PORT
+
+# -----------------------------------------------------------------------------
+# Run coordinator
+# -----------------------------------------------------------------------------
+# Queues launched runs and enforces global and per-tag concurrency limits.
+# -----------------------------------------------------------------------------
+run_coordinator:
+  module: dagster.core.run_coordinator
+  class: QueuedRunCoordinator
+  config:
+    # Global ceiling on concurrent runs. Kept intentionally low because the
+    # ingestion gRPC code-server shares its container with the workloads it
+    # launches; allowing too many runs in parallel can slow the code-server
+    # enough for the webserver and daemon to log LOCATION_ERROR / gRPC
+    # timeout churn even while the container is healthy. This value
+    # preserves gRPC responsiveness during startup catchup and the overlap
+    # of raw-audio downloads with CDS work.
+    max_concurrent_runs: 2
+
+    # Per-tag concurrency: at most one active run per unique value of the
+    # `avian/deployment` tag. Mirrors the Prefect-era `concurrency_limit`
+    # contract used by the ingestion deployments.
+    tag_concurrency_limits:
+      - key: avian/deployment
+        value:
+          applyLimitPerUniqueValue: true
+        limit: 1
+
+# -----------------------------------------------------------------------------
+# Run launcher
+# -----------------------------------------------------------------------------
+# `DefaultRunLauncher` executes each run as a local subprocess of the
+# code-server container. Worker-crash detection for `STARTED` runs is not
+# supported by this launcher; orphaned runs are reconciled at daemon
+# startup (see `run_monitoring` below).
+# -----------------------------------------------------------------------------
+run_launcher:
+  module: dagster.core.launcher
+  class: DefaultRunLauncher
+
+# -----------------------------------------------------------------------------
+# Scheduler
+# -----------------------------------------------------------------------------
+# Daemon-based scheduler. Cron-style schedules are evaluated by the
+# `ab-dagster-daemon` process.
+# -----------------------------------------------------------------------------
+scheduler:
+  module: dagster.core.scheduler
+  class: DagsterDaemonScheduler
+
+# -----------------------------------------------------------------------------
+# Run monitoring
+# -----------------------------------------------------------------------------
+# Enforces `STARTING` and `CANCELING` timeouts so runs cannot stall in those
+# transitional states indefinitely. `STARTED` worker-crash detection is not
+# available under `DefaultRunLauncher`; the daemon startup script
+# `scripts/ops/dagster_reconcile_run_state.py` fails any runs left active
+# after a host or container restart.
+# -----------------------------------------------------------------------------
+run_monitoring:
+  enabled: true
+  start_timeout_seconds: 180
+  cancel_timeout_seconds: 180
+  poll_interval_seconds: 120
+
+# -----------------------------------------------------------------------------
+# Telemetry
+# -----------------------------------------------------------------------------
+# Dagster's anonymous usage telemetry is disabled.
+# -----------------------------------------------------------------------------
+telemetry:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Auto-materialize policies
+# -----------------------------------------------------------------------------
+# AMP propagates updates from upstream ingestion assets to their downstream
+# post-processing assets (station_summary, species_tracker, audio_processing,
+# feature_engineering, quality_audit) as soon as the parents materialize.
+#
+# Sensors handle the cases AMP cannot express on its own: logical-date
+# cohort gating and incremental historical catchup (one day per tick).
+# -----------------------------------------------------------------------------
+auto_materialize:
+  enabled: true
+  use_sensors: false
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+# Disable the Dagster UI's New User Experience tour.
+# -----------------------------------------------------------------------------
+nux:
+  enabled: false
